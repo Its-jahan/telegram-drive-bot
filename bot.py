@@ -46,10 +46,19 @@ DOWNLOAD_DIR  = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/dlbot"))
 GDRIVE_FOLDER = os.environ.get("GDRIVE_FOLDER", "TelegramDownloads")
 TOKEN_FILE    = Path(os.environ.get("TOKEN_FILE", "/opt/dlbot/gdrive_token.json"))
 SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE", "/opt/dlbot/deletions.json"))
+USERS_FILE    = Path(os.environ.get("USERS_FILE",    "/opt/dlbot/users.json"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 URL_RE = re.compile(r"https?://[^\s]+|magnet:\?[^\s]+", re.IGNORECASE)
+
+# Max concurrent downloads — prevents RAM from blowing up under heavy traffic
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+
+WEBHOOK_CERT    = Path(os.environ.get("WEBHOOK_CERT", "/opt/dlbot/webhook.pem"))
+WEBHOOK_KEY     = Path(os.environ.get("WEBHOOK_KEY",  "/opt/dlbot/webhook.key"))
+WEBHOOK_PORT    = int(os.environ.get("WEBHOOK_PORT",    "8443"))   # external (nginx / firewall)
+WEBHOOK_INT_PORT= int(os.environ.get("WEBHOOK_INT_PORT","8444"))   # internal (PTB listens here)
 
 # Duration options: label → seconds
 DURATIONS = {
@@ -100,6 +109,32 @@ def add_scheduled_deletion(file_id: str, filename: str, delete_at: float) -> Non
 def remove_scheduled_deletion(file_id: str) -> None:
     entries = [e for e in load_schedule() if e["file_id"] != file_id]
     save_schedule(entries)
+
+# ── User registry ────────────────────────────────────────────────────────────
+
+def load_users() -> dict:
+    """Returns {chat_id_str: {name, username, first_seen}}"""
+    if USERS_FILE.exists():
+        try:
+            return json.loads(USERS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def register_user(user) -> None:
+    """Save a Telegram user to the registry (silent, best-effort)."""
+    try:
+        users = load_users()
+        uid = str(user.id)
+        if uid not in users:
+            users[uid] = {
+                "name":       user.full_name,
+                "username":   user.username or "",
+                "first_seen": time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime()),
+            }
+            USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2))
+    except Exception:
+        pass
 
 # ── Google Drive helpers ──────────────────────────────────────────────────────
 
@@ -216,7 +251,7 @@ _pending_flow: Flow | None = None
 _pending_chat_id: int | None = None
 _auth_server: asyncio.Server | None = None
 
-SERVER_IP    = os.environ.get("SERVER_IP", "YOUR_SERVER_IP")
+SERVER_IP    = os.environ.get("SERVER_IP", "31.59.105.156")
 OAUTH_PORT   = int(os.environ.get("OAUTH_PORT", "8888"))
 REDIRECT_URI = f"http://{SERVER_IP}:{OAUTH_PORT}"
 
@@ -251,9 +286,6 @@ async def _handle_oauth_callback(reader, writer, app) -> None:
 
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global _pending_flow, _pending_chat_id, _auth_server
-    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Not authorised.")
-        return
     flow = Flow.from_client_config(_client_config(), scopes=SCOPES, redirect_uri=REDIRECT_URI)
     auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
     _pending_flow, _pending_chat_id = flow, update.effective_chat.id
@@ -270,6 +302,7 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Bot commands ──────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
     status = "✅ Google Drive connected." if load_creds() else "⚠️ Run /auth first."
     await update.message.reply_text(
         "👋 *Internet → Google Drive Bot*\n\n"
@@ -279,6 +312,42 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"{status}",
         parse_mode="Markdown",
     )
+
+async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: broadcast a message to every registered user."""
+    user = update.effective_user
+    if not ADMIN_IDS or user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    if not context.args:
+        await update.message.reply_text(
+            "Usage: /broadcast <message>\n\nThe message is sent as-is to all users."
+        )
+        return
+
+    text = " ".join(context.args)
+    users = load_users()
+    sent = failed = 0
+    status_msg = await update.message.reply_text(f"📢 Sending to {len(users)} users…")
+    for uid in users:
+        try:
+            await context.bot.send_message(int(uid), text, parse_mode="Markdown")
+            sent += 1
+        except Exception:
+            failed += 1
+    await status_msg.edit_text(
+        f"📢 Broadcast complete.\n✅ Sent: {sent}  |  ❌ Failed: {failed}"
+    )
+
+
+async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin-only: show total registered users."""
+    if not ADMIN_IDS or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    users = load_users()
+    await update.message.reply_text(f"👥 Total registered users: *{len(users)}*", parse_mode="Markdown")
+
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if load_creds():
@@ -301,9 +370,7 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     return proc.returncode, out.decode(), err.decode()
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Not authorised.")
-        return
+    register_user(update.effective_user)
     text  = update.message.text or ""
     match = URL_RE.search(text)
     if not match:
@@ -340,9 +407,7 @@ def _duration_keyboard() -> InlineKeyboardMarkup:
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """Handles forwarded messages or direct sends that contain a media file."""
-    if ADMIN_IDS and update.effective_user.id not in ADMIN_IDS:
-        await update.message.reply_text("⛔ Not authorised.")
-        return
+    register_user(update.effective_user)
     if not load_creds():
         await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
         return
@@ -426,18 +491,19 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             parse_mode="Markdown",
         )
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
-        rc, stdout, stderr = await run_cmd([
-            "aria2c",
-            "--dir", str(DOWNLOAD_DIR),
-            "--max-connection-per-server=16",
-            "--split=16",
-            "--min-split-size=1M",
-            "--file-allocation=none",
-            "--console-log-level=warn",
-            "--summary-interval=0",
-            "--auto-file-renaming=true",
-            url,
-        ])
+        async with DOWNLOAD_SEMAPHORE:
+            rc, stdout, stderr = await run_cmd([
+                "aria2c",
+                "--dir", str(DOWNLOAD_DIR),
+                "--max-connection-per-server=16",
+                "--split=16",
+                "--min-split-size=1M",
+                "--file-allocation=none",
+                "--console-log-level=warn",
+                "--summary-interval=0",
+                "--auto-file-renaming=true",
+                url,
+            ])
         if rc != 0:
             await query.edit_message_text(
                 f"❌ Download failed:\n```{(stderr or stdout)[:400]}```",
@@ -494,20 +560,20 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         local_path = DOWNLOAD_DIR / fname
 
-        try:
-            if size_mb > TG_BOT_API_LIMIT_MB:
-                # Large file → use Pyrogram MTProto (up to 2 GB)
-                pyro_msg = await pyro.get_messages(
-                    file_info["chat_id"], file_info["msg_id"]
-                )
-                await pyro.download_media(pyro_msg, file_name=str(local_path))
-            else:
-                # Small file → regular Bot API
-                tg_file = await context.bot.get_file(file_info["tg_file_id"])
-                await tg_file.download_to_drive(str(local_path))
-        except Exception as e:
-            await query.edit_message_text(f"❌ Failed to fetch file from Telegram: {e}")
-            return
+        async with DOWNLOAD_SEMAPHORE:
+            try:
+                if size_mb > TG_BOT_API_LIMIT_MB:
+                    await ensure_pyro()
+                    pyro_msg = await pyro.get_messages(
+                        file_info["chat_id"], file_info["msg_id"]
+                    )
+                    await pyro.download_media(pyro_msg, file_name=str(local_path))
+                else:
+                    tg_file = await context.bot.get_file(file_info["tg_file_id"])
+                    await tg_file.download_to_drive(str(local_path))
+            except Exception as e:
+                await query.edit_message_text(f"❌ Failed to fetch file from Telegram: {e}")
+                return
 
         await query.edit_message_text(
             f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
@@ -545,19 +611,33 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+async def ensure_pyro() -> None:
+    """Reconnect Pyrogram if it dropped."""
+    if not pyro.is_connected:
+        try:
+            await pyro.start()
+            logger.info("Pyrogram reconnected.")
+        except Exception as e:
+            logger.warning("Pyrogram reconnect failed: %s", e)
+
 async def on_startup(app: Application) -> None:
     await pyro.start()
     logger.info("Pyrogram MTProto client started (large-file support up to 2 GB).")
     await resume_pending_deletions(app)
 
 async def on_shutdown(app: Application) -> None:
-    await pyro.stop()
+    try:
+        await pyro.stop()
+    except Exception:
+        pass
     logger.info("Pyrogram client stopped.")
 
 def main() -> None:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
+        .concurrent_updates(256)          # handle up to 256 users simultaneously
+        .connection_pool_size(32)         # more Telegram API connections
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
@@ -573,14 +653,16 @@ def main() -> None:
         | filters.Sticker.ALL
     )
 
-    app.add_handler(CommandHandler("start",  cmd_start))
-    app.add_handler(CommandHandler("status", cmd_status))
-    app.add_handler(CommandHandler("auth",   cmd_auth))
+    app.add_handler(CommandHandler("start",     cmd_start))
+    app.add_handler(CommandHandler("status",    cmd_status))
+    app.add_handler(CommandHandler("auth",      cmd_auth))
+    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
+    app.add_handler(CommandHandler("users",     cmd_users))
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    logger.info("Bot started.")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    logger.info("Bot started (polling mode, concurrent_updates=256).")
+    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
 
 if __name__ == "__main__":
     main()
