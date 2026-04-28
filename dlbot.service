@@ -1,0 +1,29 @@
+[Unit]
+Description=Telegram Download-to-Google-Drive Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/dlbot
+ExecStart=/usr/bin/python3 /opt/dlbot/bot.py
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+# ── Fill in your values below ──────────────────────────────────────────────
+Environment=BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
+Environment=GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
+Environment=GOOGLE_CLIENT_SECRET=YOUR_GOOGLE_CLIENT_SECRET
+Environment=SERVER_IP=YOUR_SERVER_PUBLIC_IP
+# ── Optional ───────────────────────────────────────────────────────────────
+Environment=DOWNLOAD_DIR=/tmp/dlbot
+Environment=GDRIVE_FOLDER=TelegramDownloads
+Environment=TOKEN_FILE=/opt/dlbot/gdrive_token.json
+Environment=SCHEDULE_FILE=/opt/dlbot/deletions.json
+Environment=OAUTH_PORT=8888
+
+[Install]
+WantedBy=multi-user.target
