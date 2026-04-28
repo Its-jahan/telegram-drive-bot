@@ -87,6 +87,11 @@ DURATIONS = {
 _pending_urls:  dict[int, str]  = {}
 _pending_files: dict[int, dict] = {}
 
+# task_id → live task state shown in health page
+# task_id = f"{chat_id}:{msg_id}"
+_tasks: dict[str, dict] = {}
+# status values: "waiting" | "downloading" | "uploading" | "done" | "error" | "timeout"
+
 # ── Pyrogram (MTProto, large-file support) ────────────────────────────────────
 API_ID   = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
@@ -525,6 +530,21 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await query.edit_message_text("⚠️ Session expired. Please send the file/link again.")
         return
 
+    fname   = file_info["filename"] if file_info else (url.split("/")[-1].split("?")[0] or url[:40])
+    size_mb = file_info["size_mb"]  if file_info else None
+    chat_id = update.effective_chat.id
+    task_id = f"{chat_id}:{msg_id}"
+
+    # Register task immediately so health page shows it as "waiting"
+    _tasks[task_id] = {
+        "filename":   fname,
+        "size_mb":    size_mb,
+        "status":     "waiting",
+        "pct":        0,
+        "started_at": time.time(),
+        "label":      label,
+    }
+
     # Acknowledge immediately so PTB is free for the next user
     await query.edit_message_text(
         "⏳ Queued! Starting download…\n"
@@ -535,8 +555,9 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     asyncio.create_task(
         _run_with_timeout(
+            task_id=task_id,
             bot=context.bot,
-            chat_id=update.effective_chat.id,
+            chat_id=chat_id,
             msg_id=msg_id,
             url=url,
             file_info=file_info,
@@ -547,18 +568,20 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
-async def _run_with_timeout(bot, chat_id, msg_id, url, file_info, label, seconds):
+async def _run_with_timeout(task_id, bot, chat_id, msg_id, url, file_info, label, seconds):
     """Wraps the actual work with a 5-minute timeout."""
     try:
         await asyncio.wait_for(
-            _do_download_upload(bot, chat_id, msg_id, url, file_info, label, seconds),
+            _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds),
             timeout=REQUEST_TIMEOUT,
         )
     except asyncio.TimeoutError:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "timeout"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
         try:
             await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
+                chat_id=chat_id, message_id=msg_id,
                 text=(
                     "⏰ *Request timed out* after 5 minutes.\n\n"
                     "The file may be too large or the server is busy.\n"
@@ -569,18 +592,27 @@ async def _run_with_timeout(bot, chat_id, msg_id, url, file_info, label, seconds
         except Exception:
             pass
     except Exception as e:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "error"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
         logger.exception("Unhandled error in _do_download_upload")
         try:
             await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=msg_id,
+                chat_id=chat_id, message_id=msg_id,
                 text=f"❌ Unexpected error: {e}",
             )
         except Exception:
             pass
 
-async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, seconds):
+async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds):
     """The actual download + Drive upload logic, runs inside a timeout."""
+
+    def _task_set(status: str, pct: int = 0, filename: str | None = None) -> None:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = status
+            _tasks[task_id]["pct"]    = pct
+            if filename:
+                _tasks[task_id]["filename"] = filename
 
     async def _edit(text: str) -> None:
         try:
@@ -596,6 +628,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
 
     # ── Branch A: URL ─────────────────────────────────────────────────────────
     if url:
+        _task_set("downloading")
         await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
 
         _health["active_downloads"] += 1
@@ -615,13 +648,15 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
 
         _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
         if rc != 0:
-            await _edit(
-                f"❌ Download failed:\n```{(stderr or stdout)[:400]}```"
-            )
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            await _edit(f"❌ Download failed:\n```{(stderr or stdout)[:400]}```")
             return
 
         items = sorted(DOWNLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         if not items:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
             await _edit("❌ Download finished but no file found.")
             return
 
@@ -631,12 +666,13 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
             else sum(f.stat().st_size for f in downloaded.rglob("*") if f.is_file())
         ) / (1024 * 1024)
 
-        # Enforce size limit after download too (URLs are unknown beforehand)
         if size_mb > MAX_FILE_MB:
             try:
                 shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
             except Exception:
                 pass
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
             await _edit(
                 f"❌ Downloaded file is too large ({size_mb:.0f} MB).\n"
                 f"Maximum is *{MAX_FILE_MB} MB*."
@@ -644,6 +680,9 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
             return
 
         fname = downloaded.name
+        _task_set("uploading", 0, fname)
+        if task_id in _tasks:
+            _tasks[task_id]["size_mb"] = size_mb
         await _edit(
             f"✅ Downloaded `{fname}` ({size_mb:.1f} MB)\n"
             f"☁️ Uploading to Google Drive…\n\n"
@@ -652,6 +691,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
 
         try:
             async def _prog(pct: int) -> None:
+                _task_set("uploading", pct)
                 await _edit(
                     f"☁️ Uploading `{fname}` to Google Drive…\n\n"
                     f"`{_make_bar(pct)}` {pct}%\n\n"
@@ -659,6 +699,8 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
                 )
             drive_file_id, link = await upload_to_drive(downloaded, on_progress=_prog)
         except Exception as e:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
             await _edit(f"❌ Upload failed: {e}")
             return
         finally:
@@ -674,6 +716,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
         fname   = file_info["filename"]
         size_mb = file_info["size_mb"]
 
+        _task_set("downloading", 0, fname)
         await _edit(
             f"📥 Fetching `{fname}` from Telegram…\n\n"
             f"🗑 Will be deleted after *{label}*"
@@ -695,10 +738,13 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
                     await tg_file.download_to_drive(str(local_path))
             except Exception as e:
                 _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
                 await _edit(f"❌ Failed to fetch file from Telegram: {e}")
                 return
         _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
 
+        _task_set("uploading", 0)
         await _edit(
             f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
             f"☁️ Uploading to Google Drive…\n\n"
@@ -707,6 +753,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
 
         try:
             async def _prog(pct: int) -> None:
+                _task_set("uploading", pct)
                 await _edit(
                     f"☁️ Uploading `{fname}` to Google Drive…\n\n"
                     f"`{_make_bar(pct)}` {pct}%\n\n"
@@ -714,6 +761,8 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
                 )
             drive_file_id, link = await upload_to_drive(local_path, on_progress=_prog)
         except Exception as e:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
             await _edit(f"❌ Upload failed: {e}")
             return
         finally:
@@ -725,6 +774,8 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
         size_mb_final = size_mb
 
     # ── Done ──────────────────────────────────────────────────────────────────
+    _task_set("done", 100)
+    asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
     _health["total_uploads"] += 1
     await _edit(
         f"✅ *Done!*\n\n"
@@ -770,39 +821,102 @@ def _health_html() -> str:
     last_act  = _health["last_activity"] or "—"
 
     def dot(ok: bool) -> str:
-        return (
-            '<span style="color:#27ae60;font-size:1.2em">●</span> OK'
-            if ok else
-            '<span style="color:#e74c3c;font-size:1.2em">●</span> DOWN'
-        )
+        c = "#27ae60" if ok else "#e74c3c"
+        t = "OK" if ok else "DOWN"
+        return f'<span style="color:{c};font-size:1.2em">●</span> {t}'
+
+    # ── Build task rows ───────────────────────────────────────────────────────
+    STATUS_META = {
+        "waiting":     ("#f39c12", "⏳", "Waiting for download slot…"),
+        "downloading": ("#4a9eff", "📥", "Downloading…"),
+        "uploading":   ("#a78bfa", "☁️", "Uploading to Google Drive"),
+        "done":        ("#27ae60", "✅", "Done"),
+        "error":       ("#e74c3c", "❌", "Failed"),
+        "timeout":     ("#e74c3c", "⏰", "Timed out"),
+    }
+
+    def _task_row(t: dict) -> str:
+        status  = t.get("status", "waiting")
+        pct     = t.get("pct", 0)
+        fname   = t.get("filename", "unknown")
+        size_mb = t.get("size_mb")
+        elapsed = int(time.time() - t.get("started_at", time.time()))
+        color, icon, label = STATUS_META.get(status, ("#888", "•", status))
+        size_str = f"  ·  {size_mb:.1f} MB" if size_mb else ""
+        mins, secs = divmod(elapsed, 60)
+        elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
+
+        # Only show bar when there's meaningful progress
+        show_bar = status in ("uploading", "done")
+        bar_html = ""
+        if show_bar:
+            bar_html = f"""
+            <div style="margin-top:8px">
+              <div style="background:#2a2d3a;border-radius:6px;height:10px;overflow:hidden">
+                <div style="width:{pct}%;height:100%;background:{color};
+                            border-radius:6px;transition:width .5s"></div>
+              </div>
+              <div style="font-size:.8rem;color:#aaa;margin-top:4px">{pct}% complete</div>
+            </div>"""
+
+        # Spinner for active states
+        spinner = ""
+        if status in ("downloading", "waiting"):
+            spinner = f' <span style="display:inline-block;animation:spin 1s linear infinite">⟳</span>'
+
+        return f"""
+        <div style="background:#1a1d27;border:1px solid {color}44;border-radius:10px;
+                    padding:14px 16px;border-left:3px solid {color}">
+          <div style="display:flex;justify-content:space-between;align-items:flex-start">
+            <div style="font-weight:600;font-size:.95rem;word-break:break-all">{icon} {fname}</div>
+            <div style="font-size:.75rem;color:#666;white-space:nowrap;margin-left:12px">
+              {elapsed_str} ago</div>
+          </div>
+          <div style="font-size:.82rem;color:{color};margin-top:4px">
+            {label}{size_str}{spinner}</div>
+          {bar_html}
+        </div>"""
+
+    tasks_html = ""
+    if _tasks:
+        rows = "\n".join(_task_row(t) for t in _tasks.values())
+        tasks_html = f"""
+<h2 style="margin:28px 0 12px;font-size:1rem;color:#aaa;letter-spacing:.05em">
+  ACTIVE TASKS ({len(_tasks)})</h2>
+<div style="display:flex;flex-direction:column;gap:10px">{rows}</div>"""
+    else:
+        tasks_html = """
+<h2 style="margin:28px 0 12px;font-size:1rem;color:#555;letter-spacing:.05em">
+  ACTIVE TASKS</h2>
+<div style="color:#555;font-size:.9rem;padding:14px 0">No active tasks right now.</div>"""
 
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<meta http-equiv="refresh" content="15">
+<meta http-equiv="refresh" content="5">
 <title>Bot Health</title>
 <style>
+  @keyframes spin {{ to {{ transform: rotate(360deg); }} }}
   * {{ box-sizing: border-box; margin: 0; padding: 0; }}
   body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-         background: #0f1117; color: #e0e0e0; padding: 24px; }}
+         background: #0f1117; color: #e0e0e0; padding: 24px; max-width: 900px; }}
   h1   {{ font-size: 1.5rem; margin-bottom: 4px; }}
   .sub {{ color: #888; font-size: .85rem; margin-bottom: 24px; }}
-  .grid {{ display: grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap: 16px; }}
-  .card {{ background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 12px; padding: 18px; }}
-  .card h2 {{ font-size: .75rem; color: #888; text-transform: uppercase;
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill,minmax(200px,1fr)); gap: 14px; }}
+  .card {{ background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 12px; padding: 16px; }}
+  .card h2 {{ font-size: .72rem; color: #666; text-transform: uppercase;
               letter-spacing: .08em; margin-bottom: 8px; }}
-  .val  {{ font-size: 1.6rem; font-weight: 700; }}
-  .small{{ font-size: .85rem; color: #aaa; margin-top: 4px; }}
-  .bar-wrap {{ background:#2a2d3a; border-radius:6px; height:8px; margin-top:8px; }}
-  .bar {{ height:8px; border-radius:6px; transition:width .4s; }}
-  a {{ color: #4a9eff; text-decoration: none; }}
+  .val  {{ font-size: 1.5rem; font-weight: 700; }}
+  .small{{ font-size: .82rem; color: #aaa; margin-top: 4px; }}
+  .bar-wrap {{ background:#2a2d3a; border-radius:6px; height:7px; margin-top:8px; }}
+  .bar {{ height:7px; border-radius:6px; }}
 </style>
 </head>
 <body>
 <h1>🤖 Telegram → Google Drive Bot</h1>
-<p class="sub">Auto-refreshes every 15 s &nbsp;·&nbsp; Uptime: {_uptime_str()}</p>
+<p class="sub">Auto-refreshes every 5 s &nbsp;·&nbsp; Uptime: {_uptime_str()}</p>
 <div class="grid">
 
   <div class="card">
@@ -826,14 +940,14 @@ def _health_html() -> str:
   <div class="card">
     <h2>Memory</h2>
     <div class="val" style="color:{mem_color}">{mem_pct}%</div>
-    <div class="small">{used_mb:,} MB / {total_mb:,} MB used</div>
+    <div class="small">{used_mb:,} MB / {total_mb:,} MB</div>
     <div class="bar-wrap"><div class="bar" style="width:{mem_pct}%;background:{mem_color}"></div></div>
   </div>
 
   <div class="card">
-    <h2>Active Downloads</h2>
+    <h2>Concurrent Downloads</h2>
     <div class="val">{act_dl} / 4</div>
-    <div class="small">Semaphore slots in use</div>
+    <div class="small">Slots in use</div>
     <div class="bar-wrap"><div class="bar" style="width:{int(act_dl/4*100)}%;background:#4a9eff"></div></div>
   </div>
 
@@ -852,16 +966,17 @@ def _health_html() -> str:
   <div class="card">
     <h2>Pending Deletions</h2>
     <div class="val">{pending_n}</div>
-    <div class="small">Files scheduled to delete</div>
+    <div class="small">Scheduled in Drive</div>
   </div>
 
   <div class="card">
     <h2>Last Activity</h2>
-    <div class="val" style="font-size:1rem">{last_act}</div>
+    <div class="val" style="font-size:.95rem">{last_act}</div>
     <div class="small">Most recent upload</div>
   </div>
 
 </div>
+{tasks_html}
 </body>
 </html>"""
 
