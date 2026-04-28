@@ -179,35 +179,42 @@ def make_public_link(service, file_id: str) -> str:
     return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
 
 async def upload_to_drive(path: Path) -> tuple[str, str]:
-    """Upload file/folder. Returns (file_id, public_link)."""
+    """Upload file/folder. Returns (file_id, public_link).
+    All Drive API calls run in a thread so the event loop stays free."""
     creds = load_creds()
     if not creds:
         raise RuntimeError("Google Drive not authorised. Run /auth first.")
-    service = build("drive", "v3", credentials=creds)
-    folder_id = get_or_create_folder(service, GDRIVE_FOLDER)
 
-    if path.is_file():
-        media = MediaFileUpload(str(path), resumable=True)
-        meta  = {"name": path.name, "parents": [folder_id]}
+    def _do_upload(upload_path: Path) -> tuple[str, str]:
+        service = build("drive", "v3", credentials=creds)
+        folder_id = get_or_create_folder(service, GDRIVE_FOLDER)
+        media = MediaFileUpload(str(upload_path), resumable=True)
+        meta  = {"name": upload_path.name, "parents": [folder_id]}
         f = service.files().create(body=meta, media_body=media, fields="id").execute()
         return f["id"], make_public_link(service, f["id"])
+
+    if path.is_file():
+        return await asyncio.to_thread(_do_upload, path)
 
     # Folder → zip first
     zip_path = Path(f"/tmp/{path.name}.zip")
     await asyncio.to_thread(shutil.make_archive, str(zip_path.with_suffix("")), "zip", str(path))
-    media = MediaFileUpload(str(zip_path), resumable=True)
-    meta  = {"name": zip_path.name, "parents": [folder_id]}
-    f = service.files().create(body=meta, media_body=media, fields="id").execute()
-    zip_path.unlink(missing_ok=True)
-    return f["id"], make_public_link(service, f["id"])
+    try:
+        return await asyncio.to_thread(_do_upload, zip_path)
+    finally:
+        zip_path.unlink(missing_ok=True)
 
 async def delete_drive_file(file_id: str) -> None:
     creds = load_creds()
     if not creds:
         return
-    service = build("drive", "v3", credentials=creds)
-    try:
+
+    def _do_delete() -> None:
+        service = build("drive", "v3", credentials=creds)
         service.files().delete(fileId=file_id).execute()
+
+    try:
+        await asyncio.to_thread(_do_delete)
         logger.info("Deleted Drive file %s", file_id)
     except Exception as e:
         logger.warning("Could not delete Drive file %s: %s", file_id, e)
@@ -231,19 +238,30 @@ async def schedule_deletion(file_id: str, filename: str, delay_seconds: int,
         pass
 
 async def resume_pending_deletions(app: Application) -> None:
-    """On startup, re-schedule any deletions that survived a restart."""
+    """On startup, re-schedule any deletions that survived a restart.
+    Overdue files are deleted as background tasks so startup never blocks."""
     entries = load_schedule()
     now = time.time()
+    resumed = overdue = 0
     for entry in entries:
         remaining = entry["delete_at"] - now
         if remaining <= 0:
-            await delete_drive_file(entry["file_id"])
-            remove_scheduled_deletion(entry["file_id"])
+            # Don't await — fire-and-forget to avoid blocking the event loop
+            asyncio.create_task(_delete_and_remove(entry["file_id"], entry["filename"]))
+            overdue += 1
         else:
             asyncio.create_task(
                 schedule_deletion(entry["file_id"], entry["filename"],
                                   int(remaining), app.bot, 0)
             )
+            resumed += 1
+    if overdue or resumed:
+        logger.info("Resuming deletions: %d overdue (background) + %d scheduled", overdue, resumed)
+
+async def _delete_and_remove(file_id: str, filename: str) -> None:
+    """Background helper: delete from Drive then remove from schedule."""
+    await delete_drive_file(file_id)
+    remove_scheduled_deletion(file_id)
 
 # ── Auth flow ─────────────────────────────────────────────────────────────────
 
@@ -636,8 +654,6 @@ def main() -> None:
     app = (
         Application.builder()
         .token(BOT_TOKEN)
-        .concurrent_updates(256)          # handle up to 256 users simultaneously
-        .connection_pool_size(32)         # more Telegram API connections
         .post_init(on_startup)
         .post_shutdown(on_shutdown)
         .build()
@@ -661,8 +677,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
-    logger.info("Bot started (polling mode, concurrent_updates=256).")
-    app.run_polling(allowed_updates=Update.ALL_TYPES, drop_pending_updates=True)
+    logger.info("Bot started.")
+    app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
