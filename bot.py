@@ -273,6 +273,35 @@ async def _delete_and_remove(file_id: str, filename: str) -> None:
     await delete_drive_file(file_id)
     remove_scheduled_deletion(file_id)
 
+LOCAL_MAX_AGE = 30 * 60   # 30 minutes — any local file older than this is stale
+
+async def _local_janitor() -> None:
+    """Runs forever. Every 5 minutes, delete any file/dir in DOWNLOAD_DIR
+    that is older than LOCAL_MAX_AGE seconds (upload finished or crashed)."""
+    while True:
+        await asyncio.sleep(5 * 60)
+        try:
+            if not DOWNLOAD_DIR.exists():
+                continue
+            now = time.time()
+            removed = []
+            for item in DOWNLOAD_DIR.iterdir():
+                try:
+                    age = now - item.stat().st_mtime
+                    if age > LOCAL_MAX_AGE:
+                        if item.is_dir():
+                            shutil.rmtree(item)
+                        else:
+                            item.unlink()
+                        removed.append(item.name)
+                except Exception:
+                    pass
+            if removed:
+                logger.info("Janitor removed %d stale local file(s): %s",
+                            len(removed), ", ".join(removed[:5]))
+        except Exception as e:
+            logger.warning("Janitor error: %s", e)
+
 async def resume_pending_deletions(app: Application) -> None:
     """Re-schedule deletions that survived a restart. Never blocks startup."""
     entries = load_schedule()
@@ -872,6 +901,27 @@ def _mem_info() -> tuple[int, int]:
     except Exception:
         return 0, 0
 
+def _disk_info() -> tuple[int, int, int]:
+    """Returns (used_gb, total_gb, pct) for the root filesystem."""
+    try:
+        import shutil as _sh
+        usage = _sh.disk_usage("/")
+        used  = usage.used  // (1024 ** 3)
+        total = usage.total // (1024 ** 3)
+        pct   = int(usage.used / usage.total * 100) if usage.total else 0
+        return used, total, pct
+    except Exception:
+        return 0, 0, 0
+
+def _tmp_size_mb() -> int:
+    """Size of DOWNLOAD_DIR in MB."""
+    try:
+        return int(sum(
+            f.stat().st_size for f in DOWNLOAD_DIR.rglob("*") if f.is_file()
+        ) / (1024 * 1024))
+    except Exception:
+        return 0
+
 def _uptime_str() -> str:
     secs = int(time.time() - _health["start_time"])
     h, r = divmod(secs, 3600); m, s = divmod(r, 60)
@@ -882,12 +932,15 @@ def _health_html() -> str:
     mem_pct   = int(used_mb / total_mb * 100) if total_mb else 0
     mem_color = "#e74c3c" if mem_pct > 85 else "#f39c12" if mem_pct > 65 else "#27ae60"
 
-    gdrive_ok = load_creds() is not None
-    users_n   = len(load_users())
-    pending_n = len(load_schedule())
-    act_dl    = _health["active_downloads"]
-    total_up  = _health["total_uploads"]
-    last_act  = _health["last_activity"] or "—"
+    gdrive_ok             = load_creds() is not None
+    users_n               = len(load_users())
+    pending_n             = len(load_schedule())
+    act_dl                = _health["active_downloads"]
+    total_up              = _health["total_uploads"]
+    last_act              = _health["last_activity"] or "—"
+    disk_used, disk_total, disk_pct = _disk_info()
+    disk_color            = "#e74c3c" if disk_pct > 85 else "#f39c12" if disk_pct > 65 else "#27ae60"
+    tmp_mb                = _tmp_size_mb()
 
     def dot(ok: bool) -> str:
         c = "#27ae60" if ok else "#e74c3c"
@@ -1014,6 +1067,13 @@ def _health_html() -> str:
   </div>
 
   <div class="card">
+    <h2>Disk</h2>
+    <div class="val" style="color:{disk_color}">{disk_pct}%</div>
+    <div class="small">{disk_used} GB / {disk_total} GB &nbsp;·&nbsp; /tmp: {tmp_mb} MB</div>
+    <div class="bar-wrap"><div class="bar" style="width:{disk_pct}%;background:{disk_color}"></div></div>
+  </div>
+
+  <div class="card">
     <h2>Concurrent Downloads</h2>
     <div class="val">{act_dl} / 4</div>
     <div class="small">Slots in use</div>
@@ -1075,11 +1135,14 @@ _health_server = None
 
 async def on_startup(app: Application) -> None:
     global _health_server
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     await pyro.start()
     _health["pyro_ok"] = True
     _health["bot_ok"]  = True
     logger.info("Pyrogram started (large-file support up to %d MB).", MAX_FILE_MB)
     await resume_pending_deletions(app)
+    asyncio.create_task(_local_janitor())
+    logger.info("Local janitor started (cleans files older than %d min).", LOCAL_MAX_AGE // 60)
     _health_server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
     logger.info("Health check running on http://0.0.0.0:%d", HEALTH_PORT)
 
