@@ -54,6 +54,7 @@ ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x
 SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
 OAUTH_PORT    = int(os.environ.get("OAUTH_PORT",       "8888"))
 REDIRECT_URI  = f"http://{SERVER_IP}:{OAUTH_PORT}"
+HEALTH_PORT   = int(os.environ.get("HEALTH_PORT",      "9102"))
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 URL_RE = re.compile(r"https?://[^\s]+|magnet:\?[^\s]+", re.IGNORECASE)
@@ -64,6 +65,16 @@ REQUEST_TIMEOUT     = 300    # 5 minutes max per request (download + upload)
 
 # Limit concurrent downloads so RAM never spikes
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
+
+# ── Health-check state (updated at runtime) ───────────────────────────────────
+_health: dict = {
+    "start_time":        time.time(),
+    "active_downloads":  0,
+    "total_uploads":     0,
+    "last_activity":     None,   # ISO string
+    "bot_ok":            False,
+    "pyro_ok":           False,
+}
 
 DURATIONS = {
     "1h":  ("1 hour",   3600),
@@ -581,11 +592,13 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
             pass
 
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    _health["last_activity"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
     # ── Branch A: URL ─────────────────────────────────────────────────────────
     if url:
         await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
 
+        _health["active_downloads"] += 1
         async with DOWNLOAD_SEMAPHORE:
             rc, stdout, stderr = await run_cmd([
                 "aria2c",
@@ -600,6 +613,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
                 url,
             ])
 
+        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
         if rc != 0:
             await _edit(
                 f"❌ Download failed:\n```{(stderr or stdout)[:400]}```"
@@ -667,6 +681,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
 
         local_path = DOWNLOAD_DIR / fname
 
+        _health["active_downloads"] += 1
         async with DOWNLOAD_SEMAPHORE:
             try:
                 if size_mb > TG_BOT_API_LIMIT_MB:
@@ -679,8 +694,10 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
                     tg_file = await bot.get_file(file_info["tg_file_id"])
                     await tg_file.download_to_drive(str(local_path))
             except Exception as e:
+                _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
                 await _edit(f"❌ Failed to fetch file from Telegram: {e}")
                 return
+        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
 
         await _edit(
             f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
@@ -708,6 +725,7 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
         size_mb_final = size_mb
 
     # ── Done ──────────────────────────────────────────────────────────────────
+    _health["total_uploads"] += 1
     await _edit(
         f"✅ *Done!*\n\n"
         f"📁 `{fname}`\n"
@@ -720,14 +738,172 @@ async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, secon
         schedule_deletion(drive_file_id, fname, seconds, bot, chat_id)
     )
 
+# ── Health-check HTTP server ──────────────────────────────────────────────────
+
+def _mem_info() -> tuple[int, int]:
+    """Returns (used_mb, total_mb) from /proc/meminfo."""
+    try:
+        info = {}
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, v = line.split(":"); info[k.strip()] = int(v.split()[0])
+        total = info["MemTotal"] // 1024
+        free  = (info["MemFree"] + info["Buffers"] + info["Cached"]) // 1024
+        return total - free, total
+    except Exception:
+        return 0, 0
+
+def _uptime_str() -> str:
+    secs = int(time.time() - _health["start_time"])
+    h, r = divmod(secs, 3600); m, s = divmod(r, 60)
+    return f"{h}h {m}m {s}s" if h else f"{m}m {s}s"
+
+def _health_html() -> str:
+    used_mb, total_mb = _mem_info()
+    mem_pct   = int(used_mb / total_mb * 100) if total_mb else 0
+    mem_color = "#e74c3c" if mem_pct > 85 else "#f39c12" if mem_pct > 65 else "#27ae60"
+
+    gdrive_ok = load_creds() is not None
+    users_n   = len(load_users())
+    pending_n = len(load_schedule())
+    act_dl    = _health["active_downloads"]
+    total_up  = _health["total_uploads"]
+    last_act  = _health["last_activity"] or "—"
+
+    def dot(ok: bool) -> str:
+        return (
+            '<span style="color:#27ae60;font-size:1.2em">●</span> OK'
+            if ok else
+            '<span style="color:#e74c3c;font-size:1.2em">●</span> DOWN'
+        )
+
+    return f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="refresh" content="15">
+<title>Bot Health</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         background: #0f1117; color: #e0e0e0; padding: 24px; }}
+  h1   {{ font-size: 1.5rem; margin-bottom: 4px; }}
+  .sub {{ color: #888; font-size: .85rem; margin-bottom: 24px; }}
+  .grid {{ display: grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap: 16px; }}
+  .card {{ background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 12px; padding: 18px; }}
+  .card h2 {{ font-size: .75rem; color: #888; text-transform: uppercase;
+              letter-spacing: .08em; margin-bottom: 8px; }}
+  .val  {{ font-size: 1.6rem; font-weight: 700; }}
+  .small{{ font-size: .85rem; color: #aaa; margin-top: 4px; }}
+  .bar-wrap {{ background:#2a2d3a; border-radius:6px; height:8px; margin-top:8px; }}
+  .bar {{ height:8px; border-radius:6px; transition:width .4s; }}
+  a {{ color: #4a9eff; text-decoration: none; }}
+</style>
+</head>
+<body>
+<h1>🤖 Telegram → Google Drive Bot</h1>
+<p class="sub">Auto-refreshes every 15 s &nbsp;·&nbsp; Uptime: {_uptime_str()}</p>
+<div class="grid">
+
+  <div class="card">
+    <h2>Bot Polling</h2>
+    <div class="val">{dot(_health["bot_ok"])}</div>
+    <div class="small">python-telegram-bot</div>
+  </div>
+
+  <div class="card">
+    <h2>Pyrogram (MTProto)</h2>
+    <div class="val">{dot(_health["pyro_ok"])}</div>
+    <div class="small">Large-file engine</div>
+  </div>
+
+  <div class="card">
+    <h2>Google Drive</h2>
+    <div class="val">{dot(gdrive_ok)}</div>
+    <div class="small">OAuth token {'valid' if gdrive_ok else 'missing/expired'}</div>
+  </div>
+
+  <div class="card">
+    <h2>Memory</h2>
+    <div class="val" style="color:{mem_color}">{mem_pct}%</div>
+    <div class="small">{used_mb:,} MB / {total_mb:,} MB used</div>
+    <div class="bar-wrap"><div class="bar" style="width:{mem_pct}%;background:{mem_color}"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>Active Downloads</h2>
+    <div class="val">{act_dl} / 4</div>
+    <div class="small">Semaphore slots in use</div>
+    <div class="bar-wrap"><div class="bar" style="width:{int(act_dl/4*100)}%;background:#4a9eff"></div></div>
+  </div>
+
+  <div class="card">
+    <h2>Total Uploads</h2>
+    <div class="val">{total_up}</div>
+    <div class="small">Since last restart</div>
+  </div>
+
+  <div class="card">
+    <h2>Registered Users</h2>
+    <div class="val">{users_n}</div>
+    <div class="small">All-time</div>
+  </div>
+
+  <div class="card">
+    <h2>Pending Deletions</h2>
+    <div class="val">{pending_n}</div>
+    <div class="small">Files scheduled to delete</div>
+  </div>
+
+  <div class="card">
+    <h2>Last Activity</h2>
+    <div class="val" style="font-size:1rem">{last_act}</div>
+    <div class="small">Most recent upload</div>
+  </div>
+
+</div>
+</body>
+</html>"""
+
+async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+    try:
+        await asyncio.wait_for(reader.read(1024), timeout=5)
+        # Update live flags
+        _health["bot_ok"]  = True   # if we're serving, the event loop is alive
+        _health["pyro_ok"] = pyro.is_connected
+        body = _health_html().encode()
+        writer.write(
+            b"HTTP/1.1 200 OK\r\n"
+            b"Content-Type: text/html; charset=utf-8\r\n"
+            b"Cache-Control: no-cache\r\n"
+            + f"Content-Length: {len(body)}\r\n\r\n".encode()
+            + body
+        )
+        await writer.drain()
+    except Exception:
+        pass
+    finally:
+        writer.close()
+
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
+_health_server = None
+
 async def on_startup(app: Application) -> None:
+    global _health_server
     await pyro.start()
+    _health["pyro_ok"] = True
+    _health["bot_ok"]  = True
     logger.info("Pyrogram started (large-file support up to %d MB).", MAX_FILE_MB)
     await resume_pending_deletions(app)
+    _health_server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
+    logger.info("Health check running on http://0.0.0.0:%d", HEALTH_PORT)
 
 async def on_shutdown(app: Application) -> None:
+    global _health_server
+    _health["bot_ok"] = False
+    if _health_server:
+        _health_server.close()
     try:
         await pyro.stop()
     except Exception:
