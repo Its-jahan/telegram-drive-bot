@@ -409,6 +409,37 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     out, err = await proc.communicate()
     return proc.returncode, out.decode(), err.decode()
 
+async def run_aria2(url: str, dest_dir: Path, on_progress=None) -> tuple[int, str, str]:
+    """Run aria2c and stream stderr so on_progress(0-100) is called in real-time."""
+    proc = await asyncio.create_subprocess_exec(
+        "aria2c",
+        "--dir", str(dest_dir),
+        "--max-connection-per-server=16",
+        "--split=16",
+        "--min-split-size=1M",
+        "--file-allocation=none",
+        "--auto-file-renaming=true",
+        "--console-log-level=notice",   # enables progress lines on stderr
+        "--summary-interval=1",         # print progress every second
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stderr_lines: list[str] = []
+
+    async def _stream_stderr() -> None:
+        async for raw in proc.stderr:
+            line = raw.decode(errors="ignore").strip()
+            stderr_lines.append(line)
+            if on_progress:
+                m = re.search(r"\((\d+)%\)", line)
+                if m:
+                    await on_progress(int(m.group(1)))
+
+    stdout_bytes, _ = await asyncio.gather(proc.stdout.read(), _stream_stderr())
+    await proc.wait()
+    return proc.returncode, stdout_bytes.decode(), "\n".join(stderr_lines)
+
 def _duration_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [
@@ -627,24 +658,30 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
     _health["last_activity"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
     # ── Branch A: URL ─────────────────────────────────────────────────────────
+    # Throttle Telegram message edits — max 1 per 3 s to avoid flood limits
+    _last_edit_ts = [0.0]
+    async def _edit_throttled(text: str, force: bool = False) -> None:
+        now = time.time()
+        if not force and now - _last_edit_ts[0] < 3.0:
+            return
+        _last_edit_ts[0] = now
+        await _edit(text)
+
     if url:
         _task_set("downloading")
         await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
 
+        async def _dl_prog(pct: int) -> None:
+            _task_set("downloading", pct)
+            await _edit_throttled(
+                f"📥 Downloading…\n`{url[:60]}`\n\n"
+                f"`{_make_bar(pct)}` {pct}%\n\n"
+                f"🗑 Will be deleted after *{label}*"
+            )
+
         _health["active_downloads"] += 1
         async with DOWNLOAD_SEMAPHORE:
-            rc, stdout, stderr = await run_cmd([
-                "aria2c",
-                "--dir", str(DOWNLOAD_DIR),
-                "--max-connection-per-server=16",
-                "--split=16",
-                "--min-split-size=1M",
-                "--file-allocation=none",
-                "--console-log-level=warn",
-                "--summary-interval=0",
-                "--auto-file-renaming=true",
-                url,
-            ])
+            rc, stdout, stderr = await run_aria2(url, DOWNLOAD_DIR, on_progress=_dl_prog)
 
         _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
         if rc != 0:
@@ -719,23 +756,55 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
         _task_set("downloading", 0, fname)
         await _edit(
             f"📥 Fetching `{fname}` from Telegram…\n\n"
+            f"`{_make_bar(0)}` 0%\n\n"
             f"🗑 Will be deleted after *{label}*"
         )
 
         local_path = DOWNLOAD_DIR / fname
+        size_bytes = int(size_mb * 1024 * 1024)
+
+        async def _fetch_prog(pct: int) -> None:
+            _task_set("downloading", pct)
+            await _edit_throttled(
+                f"📥 Fetching `{fname}` from Telegram…\n\n"
+                f"`{_make_bar(pct)}` {pct}%\n\n"
+                f"🗑 Will be deleted after *{label}*"
+            )
 
         _health["active_downloads"] += 1
         async with DOWNLOAD_SEMAPHORE:
             try:
                 if size_mb > TG_BOT_API_LIMIT_MB:
+                    # Pyrogram has a native progress callback
                     await ensure_pyro()
                     pyro_msg = await pyro.get_messages(
                         file_info["chat_id"], file_info["msg_id"]
                     )
-                    await pyro.download_media(pyro_msg, file_name=str(local_path))
+
+                    async def _pyro_cb(current: int, total: int) -> None:
+                        pct = int(current / total * 100) if total else 0
+                        await _fetch_prog(pct)
+
+                    await pyro.download_media(
+                        pyro_msg,
+                        file_name=str(local_path),
+                        progress=_pyro_cb,
+                    )
                 else:
+                    # Bot API: poll file size on disk while downloading
                     tg_file = await bot.get_file(file_info["tg_file_id"])
-                    await tg_file.download_to_drive(str(local_path))
+                    dl_task  = asyncio.create_task(
+                        tg_file.download_to_drive(str(local_path))
+                    )
+                    while not dl_task.done():
+                        try:
+                            current = local_path.stat().st_size if local_path.exists() else 0
+                            pct = int(current / size_bytes * 100) if size_bytes else 0
+                            await _fetch_prog(min(pct, 99))
+                        except Exception:
+                            pass
+                        await asyncio.sleep(0.4)
+                    await dl_task   # re-raise any exception
             except Exception as e:
                 _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
                 _task_set("error")
@@ -846,8 +915,8 @@ def _health_html() -> str:
         mins, secs = divmod(elapsed, 60)
         elapsed_str = f"{mins}m {secs}s" if mins else f"{secs}s"
 
-        # Only show bar when there's meaningful progress
-        show_bar = status in ("uploading", "done")
+        # Show bar for downloading (real %) and uploading; spinner for waiting
+        show_bar = status in ("downloading", "uploading", "done")
         bar_html = ""
         if show_bar:
             bar_html = f"""
@@ -859,9 +928,9 @@ def _health_html() -> str:
               <div style="font-size:.8rem;color:#aaa;margin-top:4px">{pct}% complete</div>
             </div>"""
 
-        # Spinner for active states
+        # Spinner only for waiting (downloading shows bar instead)
         spinner = ""
-        if status in ("downloading", "waiting"):
+        if status == "waiting":
             spinner = f' <span style="display:inline-block;animation:spin 1s linear infinite">⟳</span>'
 
         return f"""
