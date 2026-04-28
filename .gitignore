@@ -1,0 +1,18 @@
+# Secrets & tokens
+gdrive_token.json
+*.session
+*.session-journal
+deletions.json
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db

@@ -1,26 +1,12 @@
 #!/usr/bin/env python3
-"""
-Run this script ONCE on your local machine (with a browser) to authorise
-Google Drive access. It saves a token file that you then copy to the server.
+"""Run once locally to get a Google Drive OAuth token, then copy it to the server."""
 
-Usage:
-    pip install google-auth-oauthlib
-    python3 get_token.py
-    # Browser opens → sign in → approve
-    # Token saved to gdrive_token.json
-    # Copy it to your server: scp gdrive_token.json root@YOUR_SERVER:/opt/dlbot/gdrive_token.json
-"""
-
-import os
 from google_auth_oauthlib.flow import InstalledAppFlow
+import json
 
-CLIENT_ID     = os.environ.get("GOOGLE_CLIENT_ID", "")
-CLIENT_SECRET = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+CLIENT_ID     = "YOUR_GOOGLE_CLIENT_ID"
+CLIENT_SECRET = "YOUR_GOOGLE_CLIENT_SECRET"
 SCOPES        = ["https://www.googleapis.com/auth/drive.file"]
-
-if not CLIENT_ID or not CLIENT_SECRET:
-    print("Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET environment variables first.")
-    raise SystemExit(1)
 
 client_config = {
     "installed": {
@@ -32,12 +18,12 @@ client_config = {
     }
 }
 
-flow  = InstalledAppFlow.from_client_config(client_config, SCOPES)
+flow = InstalledAppFlow.from_client_config(client_config, SCOPES)
 creds = flow.run_local_server(port=0, open_browser=True)
 
-with open("gdrive_token.json", "w") as f:
-    f.write(creds.to_json())
+token_json = creds.to_json()
+with open("/tmp/gdrive_token.json", "w") as f:
+    f.write(token_json)
 
-print("\n✅ Token saved to gdrive_token.json")
-print("Copy it to your server:")
-print("  scp gdrive_token.json root@YOUR_SERVER:/opt/dlbot/gdrive_token.json")
+print("\n✅ Token saved to /tmp/gdrive_token.json")
+print("Now copying to server...")

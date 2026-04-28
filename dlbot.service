@@ -13,17 +13,22 @@ RestartSec=10
 StandardOutput=journal
 StandardError=journal
 
-# ── Fill in your values below ──────────────────────────────────────────────
+# ── Required — fill in your values ────────────────────────────────────────
 Environment=BOT_TOKEN=YOUR_TELEGRAM_BOT_TOKEN
 Environment=GOOGLE_CLIENT_ID=YOUR_GOOGLE_CLIENT_ID
 Environment=GOOGLE_CLIENT_SECRET=YOUR_GOOGLE_CLIENT_SECRET
+Environment=TG_API_ID=YOUR_TELEGRAM_API_ID
+Environment=TG_API_HASH=YOUR_TELEGRAM_API_HASH
 Environment=SERVER_IP=YOUR_SERVER_PUBLIC_IP
-# ── Optional ───────────────────────────────────────────────────────────────
+
+# ── Optional / defaults ────────────────────────────────────────────────────
 Environment=DOWNLOAD_DIR=/tmp/dlbot
 Environment=GDRIVE_FOLDER=TelegramDownloads
 Environment=TOKEN_FILE=/opt/dlbot/gdrive_token.json
 Environment=SCHEDULE_FILE=/opt/dlbot/deletions.json
 Environment=OAUTH_PORT=8888
+# Comma-separated Telegram user IDs allowed to use the bot (leave empty = public)
+Environment=ADMIN_IDS=
 
 [Install]
 WantedBy=multi-user.target
