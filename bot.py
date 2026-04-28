@@ -1,8 +1,11 @@
 #!/usr/bin/env python3
 """
 Telegram Download-to-Google-Drive Bot
-Downloads files with aria2, uploads to Google Drive, returns share link.
-Asks user how long to keep the file, then auto-deletes from Drive.
+- aria2 for URL downloads, Pyrogram MTProto for Telegram files up to 800 MB
+- Non-blocking: every download runs as a background task
+- Progress bar during Google Drive upload
+- 5-minute timeout per request
+- Auto-delete from Drive after chosen duration
 """
 
 import asyncio
@@ -38,29 +41,30 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# ── Config ───────────────────────────────────────────────────────────────────
+# ── Config ────────────────────────────────────────────────────────────────────
 BOT_TOKEN     = os.environ["BOT_TOKEN"]
 CLIENT_ID     = os.environ["GOOGLE_CLIENT_ID"]
 CLIENT_SECRET = os.environ["GOOGLE_CLIENT_SECRET"]
-DOWNLOAD_DIR  = Path(os.environ.get("DOWNLOAD_DIR", "/tmp/dlbot"))
-GDRIVE_FOLDER = os.environ.get("GDRIVE_FOLDER", "TelegramDownloads")
-TOKEN_FILE    = Path(os.environ.get("TOKEN_FILE", "/opt/dlbot/gdrive_token.json"))
-SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE", "/opt/dlbot/deletions.json"))
-USERS_FILE    = Path(os.environ.get("USERS_FILE",    "/opt/dlbot/users.json"))
+DOWNLOAD_DIR  = Path(os.environ.get("DOWNLOAD_DIR",   "/tmp/dlbot"))
+GDRIVE_FOLDER = os.environ.get("GDRIVE_FOLDER",       "TelegramDownloads")
+TOKEN_FILE    = Path(os.environ.get("TOKEN_FILE",      "/opt/dlbot/gdrive_token.json"))
+SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE",  "/opt/dlbot/deletions.json"))
+USERS_FILE    = Path(os.environ.get("USERS_FILE",      "/opt/dlbot/users.json"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
+SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
+OAUTH_PORT    = int(os.environ.get("OAUTH_PORT",       "8888"))
+REDIRECT_URI  = f"http://{SERVER_IP}:{OAUTH_PORT}"
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
 URL_RE = re.compile(r"https?://[^\s]+|magnet:\?[^\s]+", re.IGNORECASE)
 
-# Max concurrent downloads — prevents RAM from blowing up under heavy traffic
+MAX_FILE_MB         = 800    # Hard cap for users
+TG_BOT_API_LIMIT_MB = 20     # Bot API hard cap; above this → Pyrogram
+REQUEST_TIMEOUT     = 300    # 5 minutes max per request (download + upload)
+
+# Limit concurrent downloads so RAM never spikes
 DOWNLOAD_SEMAPHORE = asyncio.Semaphore(4)
 
-WEBHOOK_CERT    = Path(os.environ.get("WEBHOOK_CERT", "/opt/dlbot/webhook.pem"))
-WEBHOOK_KEY     = Path(os.environ.get("WEBHOOK_KEY",  "/opt/dlbot/webhook.key"))
-WEBHOOK_PORT    = int(os.environ.get("WEBHOOK_PORT",    "8443"))   # external (nginx / firewall)
-WEBHOOK_INT_PORT= int(os.environ.get("WEBHOOK_INT_PORT","8444"))   # internal (PTB listens here)
-
-# Duration options: label → seconds
 DURATIONS = {
     "1h":  ("1 hour",   3600),
     "5h":  ("5 hours",  18000),
@@ -68,15 +72,11 @@ DURATIONS = {
     "1d":  ("1 day",    86400),
 }
 
-# Pending URL store:  message_id → url
+# message_id → pending data
 _pending_urls:  dict[int, str]  = {}
-# Pending file store: message_id → {tg_file_id, chat_id, msg_id, filename, size_mb}
 _pending_files: dict[int, dict] = {}
 
-TG_BOT_API_LIMIT_MB = 20    # Bot API hard cap
-TG_PYRO_LIMIT_MB    = 2000  # Pyrogram / MTProto cap
-
-# ── Pyrogram client (MTProto — used for files > 20 MB) ───────────────────────
+# ── Pyrogram (MTProto, large-file support) ────────────────────────────────────
 API_ID   = int(os.environ["TG_API_ID"])
 API_HASH = os.environ["TG_API_HASH"]
 
@@ -85,7 +85,7 @@ pyro: PyroClient = PyroClient(
     api_id=API_ID,
     api_hash=API_HASH,
     bot_token=BOT_TOKEN,
-    workdir=str(TOKEN_FILE.parent),  # /opt/dlbot
+    workdir=str(TOKEN_FILE.parent),
 )
 
 # ── Scheduled deletion persistence ───────────────────────────────────────────
@@ -110,10 +110,9 @@ def remove_scheduled_deletion(file_id: str) -> None:
     entries = [e for e in load_schedule() if e["file_id"] != file_id]
     save_schedule(entries)
 
-# ── User registry ────────────────────────────────────────────────────────────
+# ── User registry ─────────────────────────────────────────────────────────────
 
 def load_users() -> dict:
-    """Returns {chat_id_str: {name, username, first_seen}}"""
     if USERS_FILE.exists():
         try:
             return json.loads(USERS_FILE.read_text())
@@ -122,7 +121,6 @@ def load_users() -> dict:
     return {}
 
 def register_user(user) -> None:
-    """Save a Telegram user to the registry (silent, best-effort)."""
     try:
         users = load_users()
         uid = str(user.id)
@@ -172,26 +170,44 @@ def get_or_create_folder(service, name: str) -> str:
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     return service.files().create(body=meta, fields="id").execute()["id"]
 
-def make_public_link(service, file_id: str) -> str:
-    service.permissions().create(
-        fileId=file_id, body={"type": "anyone", "role": "reader"}
-    ).execute()
-    return f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+def _make_bar(pct: int, width: int = 20) -> str:
+    filled = int(width * pct / 100)
+    return "█" * filled + "░" * (width - filled)
 
-async def upload_to_drive(path: Path) -> tuple[str, str]:
-    """Upload file/folder. Returns (file_id, public_link).
-    All Drive API calls run in a thread so the event loop stays free."""
+async def upload_to_drive(path: Path, on_progress=None) -> tuple[str, str]:
+    """Upload file to Drive. Calls on_progress(0-100) every ~10%.
+    All blocking Drive API calls run in a thread pool."""
     creds = load_creds()
     if not creds:
         raise RuntimeError("Google Drive not authorised. Run /auth first.")
+    loop = asyncio.get_running_loop()
 
     def _do_upload(upload_path: Path) -> tuple[str, str]:
         service = build("drive", "v3", credentials=creds)
         folder_id = get_or_create_folder(service, GDRIVE_FOLDER)
-        media = MediaFileUpload(str(upload_path), resumable=True)
+        # 8 MB chunks — good balance between progress granularity and API calls
+        media = MediaFileUpload(str(upload_path), resumable=True, chunksize=8 * 1024 * 1024)
         meta  = {"name": upload_path.name, "parents": [folder_id]}
-        f = service.files().create(body=meta, media_body=media, fields="id").execute()
-        return f["id"], make_public_link(service, f["id"])
+        req   = service.files().create(body=meta, media_body=media, fields="id")
+
+        response = None
+        last_pct = -1
+        while response is None:
+            status, response = req.next_chunk()
+            if status and on_progress:
+                pct = int(status.progress() * 100)
+                if pct >= last_pct + 10:          # report every 10%
+                    last_pct = pct
+                    asyncio.run_coroutine_threadsafe(on_progress(pct), loop)
+
+        if on_progress:
+            asyncio.run_coroutine_threadsafe(on_progress(100), loop)
+
+        file_id = response["id"]
+        service.permissions().create(
+            fileId=file_id, body={"type": "anyone", "role": "reader"}
+        ).execute()
+        return file_id, f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
 
     if path.is_file():
         return await asyncio.to_thread(_do_upload, path)
@@ -237,16 +253,18 @@ async def schedule_deletion(file_id: str, filename: str, delay_seconds: int,
     except Exception:
         pass
 
+async def _delete_and_remove(file_id: str, filename: str) -> None:
+    await delete_drive_file(file_id)
+    remove_scheduled_deletion(file_id)
+
 async def resume_pending_deletions(app: Application) -> None:
-    """On startup, re-schedule any deletions that survived a restart.
-    Overdue files are deleted as background tasks so startup never blocks."""
+    """Re-schedule deletions that survived a restart. Never blocks startup."""
     entries = load_schedule()
     now = time.time()
-    resumed = overdue = 0
+    overdue = resumed = 0
     for entry in entries:
         remaining = entry["delete_at"] - now
         if remaining <= 0:
-            # Don't await — fire-and-forget to avoid blocking the event loop
             asyncio.create_task(_delete_and_remove(entry["file_id"], entry["filename"]))
             overdue += 1
         else:
@@ -256,22 +274,13 @@ async def resume_pending_deletions(app: Application) -> None:
             )
             resumed += 1
     if overdue or resumed:
-        logger.info("Resuming deletions: %d overdue (background) + %d scheduled", overdue, resumed)
-
-async def _delete_and_remove(file_id: str, filename: str) -> None:
-    """Background helper: delete from Drive then remove from schedule."""
-    await delete_drive_file(file_id)
-    remove_scheduled_deletion(file_id)
+        logger.info("Resuming: %d overdue deletions (background) + %d scheduled", overdue, resumed)
 
 # ── Auth flow ─────────────────────────────────────────────────────────────────
 
 _pending_flow: Flow | None = None
 _pending_chat_id: int | None = None
-_auth_server: asyncio.Server | None = None
-
-SERVER_IP    = os.environ.get("SERVER_IP", "31.59.105.156")
-OAUTH_PORT   = int(os.environ.get("OAUTH_PORT", "8888"))
-REDIRECT_URI = f"http://{SERVER_IP}:{OAUTH_PORT}"
+_auth_server = None
 
 async def _handle_oauth_callback(reader, writer, app) -> None:
     global _pending_flow, _pending_chat_id, _auth_server
@@ -327,23 +336,32 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I can save files to Google Drive in two ways:\n\n"
         "🔗 *Send a download link* — I'll download it on the server\n"
         "📨 *Forward any message* — I'll grab the attached file directly\n\n"
+        f"📦 Max file size: *{MAX_FILE_MB} MB*\n"
+        f"⏱ Max wait per request: *5 minutes*\n\n"
         f"{status}",
         parse_mode="Markdown",
     )
 
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if load_creds():
+        entries = load_schedule()
+        sched_text = f"\n⏳ {len(entries)} file(s) scheduled for deletion." if entries else ""
+        await update.message.reply_text(
+            f"✅ Google Drive connected\n📁 Folder: `{GDRIVE_FOLDER}`{sched_text}",
+            parse_mode="Markdown",
+        )
+    else:
+        await update.message.reply_text("❌ Not connected. Run /auth.")
+
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only: broadcast a message to every registered user."""
     user = update.effective_user
     if not ADMIN_IDS or user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
     if not context.args:
-        await update.message.reply_text(
-            "Usage: /broadcast <message>\n\nThe message is sent as-is to all users."
-        )
+        await update.message.reply_text("Usage: /broadcast <message>")
         return
-
-    text = " ".join(context.args)
+    text  = " ".join(context.args)
     users = load_users()
     sent = failed = 0
     status_msg = await update.message.reply_text(f"📢 Sending to {len(users)} users…")
@@ -357,28 +375,16 @@ async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         f"📢 Broadcast complete.\n✅ Sent: {sent}  |  ❌ Failed: {failed}"
     )
 
-
 async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Admin-only: show total registered users."""
     if not ADMIN_IDS or update.effective_user.id not in ADMIN_IDS:
         await update.message.reply_text("⛔ Admin only.")
         return
     users = load_users()
-    await update.message.reply_text(f"👥 Total registered users: *{len(users)}*", parse_mode="Markdown")
+    await update.message.reply_text(
+        f"👥 Total registered users: *{len(users)}*", parse_mode="Markdown"
+    )
 
-
-async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if load_creds():
-        entries = load_schedule()
-        sched_text = f"\n⏳ {len(entries)} file(s) scheduled for deletion." if entries else ""
-        await update.message.reply_text(
-            f"✅ Google Drive connected\n📁 Folder: `{GDRIVE_FOLDER}`{sched_text}",
-            parse_mode="Markdown",
-        )
-    else:
-        await update.message.reply_text("❌ Not connected. Run /auth.")
-
-# ── URL handler — asks for duration ──────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
 async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     proc = await asyncio.create_subprocess_exec(
@@ -386,29 +392,6 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     )
     out, err = await proc.communicate()
     return proc.returncode, out.decode(), err.decode()
-
-async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    register_user(update.effective_user)
-    text  = update.message.text or ""
-    match = URL_RE.search(text)
-    if not match:
-        await update.message.reply_text("Please send a valid download URL.")
-        return
-    if not load_creds():
-        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
-        return
-
-    url = match.group(0)
-
-    # Store URL and ask how long to keep it
-    msg = await update.message.reply_text(
-        f"🔗 Link received!\n`{url[:80]}`\n\nHow long should this file be stored on Google Drive?",
-        parse_mode="Markdown",
-        reply_markup=_duration_keyboard(),
-    )
-    _pending_urls[msg.message_id] = url
-
-# ── Forwarded / direct file handler ──────────────────────────────────────────
 
 def _duration_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
@@ -422,56 +405,79 @@ def _duration_keyboard() -> InlineKeyboardMarkup:
         ],
     ])
 
+async def ensure_pyro() -> None:
+    if not pyro.is_connected:
+        try:
+            await pyro.start()
+            logger.info("Pyrogram reconnected.")
+        except Exception as e:
+            logger.warning("Pyrogram reconnect failed: %s", e)
+
+# ── URL handler ───────────────────────────────────────────────────────────────
+
+async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    text  = update.message.text or ""
+    match = URL_RE.search(text)
+    if not match:
+        await update.message.reply_text("Please send a valid download URL.")
+        return
+    if not load_creds():
+        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
+        return
+
+    url = match.group(0)
+    msg = await update.message.reply_text(
+        f"🔗 Link received!\n`{url[:80]}`\n\nHow long should this file be stored on Google Drive?",
+        parse_mode="Markdown",
+        reply_markup=_duration_keyboard(),
+    )
+    _pending_urls[msg.message_id] = url
+
+# ── File/forward handler ──────────────────────────────────────────────────────
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handles forwarded messages or direct sends that contain a media file."""
     register_user(update.effective_user)
     if not load_creds():
         await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
         return
 
     msg = update.message
-
-    # Resolve whichever media type was sent / forwarded
     if msg.document:
-        tg_obj  = msg.document
-        fname   = tg_obj.file_name or f"document_{tg_obj.file_unique_id}"
+        tg_obj = msg.document;  fname = tg_obj.file_name or f"document_{tg_obj.file_unique_id}"
     elif msg.video:
-        tg_obj  = msg.video
-        fname   = tg_obj.file_name or f"video_{tg_obj.file_unique_id}.mp4"
+        tg_obj = msg.video;     fname = tg_obj.file_name or f"video_{tg_obj.file_unique_id}.mp4"
     elif msg.audio:
-        tg_obj  = msg.audio
-        fname   = tg_obj.file_name or f"audio_{tg_obj.file_unique_id}.mp3"
+        tg_obj = msg.audio;     fname = tg_obj.file_name or f"audio_{tg_obj.file_unique_id}.mp3"
     elif msg.voice:
-        tg_obj  = msg.voice
-        fname   = f"voice_{tg_obj.file_unique_id}.ogg"
+        tg_obj = msg.voice;     fname = f"voice_{tg_obj.file_unique_id}.ogg"
     elif msg.video_note:
-        tg_obj  = msg.video_note
-        fname   = f"videonote_{tg_obj.file_unique_id}.mp4"
+        tg_obj = msg.video_note; fname = f"videonote_{tg_obj.file_unique_id}.mp4"
     elif msg.animation:
-        tg_obj  = msg.animation
-        fname   = tg_obj.file_name or f"animation_{tg_obj.file_unique_id}.mp4"
+        tg_obj = msg.animation; fname = tg_obj.file_name or f"animation_{tg_obj.file_unique_id}.mp4"
     elif msg.photo:
-        tg_obj  = msg.photo[-1]          # largest size
-        fname   = f"photo_{tg_obj.file_unique_id}.jpg"
+        tg_obj = msg.photo[-1]; fname = f"photo_{tg_obj.file_unique_id}.jpg"
     elif msg.sticker:
-        tg_obj  = msg.sticker
-        ext     = ".webm" if msg.sticker.is_video else ".webp"
-        fname   = f"sticker_{tg_obj.file_unique_id}{ext}"
+        tg_obj = msg.sticker
+        ext    = ".webm" if msg.sticker.is_video else ".webp"
+        fname  = f"sticker_{tg_obj.file_unique_id}{ext}"
     else:
-        return   # not a media message — let the text handler deal with it
+        return
 
     size_mb = (tg_obj.file_size or 0) / (1024 * 1024)
-    is_forwarded = msg.forward_origin is not None or msg.forward_date is not None
 
-    if size_mb > TG_PYRO_LIMIT_MB:
+    if size_mb > MAX_FILE_MB:
         await msg.reply_text(
-            f"❌ File is too large ({size_mb:.0f} MB). Maximum supported size is 2000 MB."
+            f"❌ File is too large ({size_mb:.0f} MB).\n"
+            f"Maximum supported size is *{MAX_FILE_MB} MB*.",
+            parse_mode="Markdown",
         )
         return
 
-    source_tag = "📨 Forwarded file" if is_forwarded else "📎 File received"
-    method_tag  = "📡 MTProto (Pyrogram)" if size_mb > TG_BOT_API_LIMIT_MB else "⚡ Bot API"
+    is_forwarded = msg.forward_origin is not None or msg.forward_date is not None
+    source_tag   = "📨 Forwarded file" if is_forwarded else "📎 File received"
+    method_tag   = "📡 MTProto (Pyrogram)" if size_mb > TG_BOT_API_LIMIT_MB else "⚡ Bot API"
+
     prompt = await msg.reply_text(
         f"{source_tag}: `{fname}`\n"
         f"📦 Size: {size_mb:.1f} MB  |  Download via: {method_tag}\n\n"
@@ -487,28 +493,99 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "size_mb":    size_mb,
     }
 
-
-# ── Callback: duration chosen → download + upload + schedule deletion ─────────
+# ── Duration picker → dispatch background task ────────────────────────────────
 
 async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Pick duration and immediately fire a background task — never blocks PTB."""
     query = update.callback_query
     await query.answer()
 
     if not query.data.startswith("dur:"):
         return
 
-    key = query.data.split(":")[1]
+    key    = query.data.split(":")[1]
     label, seconds = DURATIONS[key]
     msg_id = query.message.message_id
 
-    # ── Branch A: URL download ────────────────────────────────────────────────
-    url = _pending_urls.pop(msg_id, None)
-    if url:
-        await query.edit_message_text(
-            f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*",
-            parse_mode="Markdown",
+    url       = _pending_urls.pop(msg_id, None)
+    file_info = _pending_files.pop(msg_id, None)
+
+    if not url and not file_info:
+        await query.edit_message_text("⚠️ Session expired. Please send the file/link again.")
+        return
+
+    # Acknowledge immediately so PTB is free for the next user
+    await query.edit_message_text(
+        "⏳ Queued! Starting download…\n"
+        f"🗑 Will be deleted after *{label}*\n\n"
+        "_(you'll see progress updates here)_",
+        parse_mode="Markdown",
+    )
+
+    asyncio.create_task(
+        _run_with_timeout(
+            bot=context.bot,
+            chat_id=update.effective_chat.id,
+            msg_id=msg_id,
+            url=url,
+            file_info=file_info,
+            label=label,
+            seconds=seconds,
         )
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+    )
+
+# ── Background worker ─────────────────────────────────────────────────────────
+
+async def _run_with_timeout(bot, chat_id, msg_id, url, file_info, label, seconds):
+    """Wraps the actual work with a 5-minute timeout."""
+    try:
+        await asyncio.wait_for(
+            _do_download_upload(bot, chat_id, msg_id, url, file_info, label, seconds),
+            timeout=REQUEST_TIMEOUT,
+        )
+    except asyncio.TimeoutError:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=(
+                    "⏰ *Request timed out* after 5 minutes.\n\n"
+                    "The file may be too large or the server is busy.\n"
+                    "Please send it again."
+                ),
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    except Exception as e:
+        logger.exception("Unhandled error in _do_download_upload")
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=msg_id,
+                text=f"❌ Unexpected error: {e}",
+            )
+        except Exception:
+            pass
+
+async def _do_download_upload(bot, chat_id, msg_id, url, file_info, label, seconds):
+    """The actual download + Drive upload logic, runs inside a timeout."""
+
+    async def _edit(text: str) -> None:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=text, parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+
+    DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ── Branch A: URL ─────────────────────────────────────────────────────────
+    if url:
+        await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
+
         async with DOWNLOAD_SEMAPHORE:
             rc, stdout, stderr = await run_cmd([
                 "aria2c",
@@ -522,16 +599,16 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 "--auto-file-renaming=true",
                 url,
             ])
+
         if rc != 0:
-            await query.edit_message_text(
-                f"❌ Download failed:\n```{(stderr or stdout)[:400]}```",
-                parse_mode="Markdown",
+            await _edit(
+                f"❌ Download failed:\n```{(stderr or stdout)[:400]}```"
             )
             return
 
         items = sorted(DOWNLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
         if not items:
-            await query.edit_message_text("❌ Download finished but no file found.")
+            await _edit("❌ Download finished but no file found.")
             return
 
         downloaded = items[0]
@@ -540,16 +617,35 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             else sum(f.stat().st_size for f in downloaded.rglob("*") if f.is_file())
         ) / (1024 * 1024)
 
-        await query.edit_message_text(
-            f"✅ Downloaded `{downloaded.name}` ({size_mb:.1f} MB)\n"
-            f"☁️ Uploading to Google Drive…\n\n🗑 Will be deleted after *{label}*",
-            parse_mode="Markdown",
+        # Enforce size limit after download too (URLs are unknown beforehand)
+        if size_mb > MAX_FILE_MB:
+            try:
+                shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
+            except Exception:
+                pass
+            await _edit(
+                f"❌ Downloaded file is too large ({size_mb:.0f} MB).\n"
+                f"Maximum is *{MAX_FILE_MB} MB*."
+            )
+            return
+
+        fname = downloaded.name
+        await _edit(
+            f"✅ Downloaded `{fname}` ({size_mb:.1f} MB)\n"
+            f"☁️ Uploading to Google Drive…\n\n"
+            f"🗑 Will be deleted after *{label}*"
         )
 
         try:
-            drive_file_id, link = await upload_to_drive(downloaded)
+            async def _prog(pct: int) -> None:
+                await _edit(
+                    f"☁️ Uploading `{fname}` to Google Drive…\n\n"
+                    f"`{_make_bar(pct)}` {pct}%\n\n"
+                    f"🗑 Will be deleted after *{label}*"
+                )
+            drive_file_id, link = await upload_to_drive(downloaded, on_progress=_prog)
         except Exception as e:
-            await query.edit_message_text(f"❌ Upload failed: {e}")
+            await _edit(f"❌ Upload failed: {e}")
             return
         finally:
             try:
@@ -557,25 +653,18 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             except Exception:
                 pass
 
-        fname   = downloaded.name
         size_mb_final = size_mb
 
-    # ── Branch B: Telegram file download ─────────────────────────────────────
+    # ── Branch B: Telegram file ───────────────────────────────────────────────
     else:
-        file_info = _pending_files.pop(msg_id, None)
-        if not file_info:
-            await query.edit_message_text("⚠️ Session expired. Please forward the file again.")
-            return
-
         fname   = file_info["filename"]
         size_mb = file_info["size_mb"]
 
-        await query.edit_message_text(
-            f"📥 Fetching `{fname}` from Telegram…\n\n🗑 Will be deleted after *{label}*",
-            parse_mode="Markdown",
+        await _edit(
+            f"📥 Fetching `{fname}` from Telegram…\n\n"
+            f"🗑 Will be deleted after *{label}*"
         )
 
-        DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
         local_path = DOWNLOAD_DIR / fname
 
         async with DOWNLOAD_SEMAPHORE:
@@ -587,22 +676,28 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                     await pyro.download_media(pyro_msg, file_name=str(local_path))
                 else:
-                    tg_file = await context.bot.get_file(file_info["tg_file_id"])
+                    tg_file = await bot.get_file(file_info["tg_file_id"])
                     await tg_file.download_to_drive(str(local_path))
             except Exception as e:
-                await query.edit_message_text(f"❌ Failed to fetch file from Telegram: {e}")
+                await _edit(f"❌ Failed to fetch file from Telegram: {e}")
                 return
 
-        await query.edit_message_text(
+        await _edit(
             f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
-            f"☁️ Uploading to Google Drive…\n\n🗑 Will be deleted after *{label}*",
-            parse_mode="Markdown",
+            f"☁️ Uploading to Google Drive…\n\n"
+            f"🗑 Will be deleted after *{label}*"
         )
 
         try:
-            drive_file_id, link = await upload_to_drive(local_path)
+            async def _prog(pct: int) -> None:
+                await _edit(
+                    f"☁️ Uploading `{fname}` to Google Drive…\n\n"
+                    f"`{_make_bar(pct)}` {pct}%\n\n"
+                    f"🗑 Will be deleted after *{label}*"
+                )
+            drive_file_id, link = await upload_to_drive(local_path, on_progress=_prog)
         except Exception as e:
-            await query.edit_message_text(f"❌ Upload failed: {e}")
+            await _edit(f"❌ Upload failed: {e}")
             return
         finally:
             try:
@@ -612,35 +707,24 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
         size_mb_final = size_mb
 
-    # ── Final message (both branches) ────────────────────────────────────────
-    await query.edit_message_text(
+    # ── Done ──────────────────────────────────────────────────────────────────
+    await _edit(
         f"✅ *Done!*\n\n"
         f"📁 `{fname}`\n"
         f"📦 {size_mb_final:.1f} MB\n"
         f"🗑 Auto-delete in: *{label}*\n\n"
-        f"🔗 [Open in Google Drive]({link})",
-        parse_mode="Markdown",
+        f"🔗 [Open in Google Drive]({link})"
     )
 
     asyncio.create_task(
-        schedule_deletion(drive_file_id, fname, seconds,
-                          context.bot, update.effective_chat.id)
+        schedule_deletion(drive_file_id, fname, seconds, bot, chat_id)
     )
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-async def ensure_pyro() -> None:
-    """Reconnect Pyrogram if it dropped."""
-    if not pyro.is_connected:
-        try:
-            await pyro.start()
-            logger.info("Pyrogram reconnected.")
-        except Exception as e:
-            logger.warning("Pyrogram reconnect failed: %s", e)
+# ── Lifecycle ─────────────────────────────────────────────────────────────────
 
 async def on_startup(app: Application) -> None:
     await pyro.start()
-    logger.info("Pyrogram MTProto client started (large-file support up to 2 GB).")
+    logger.info("Pyrogram started (large-file support up to %d MB).", MAX_FILE_MB)
     await resume_pending_deletions(app)
 
 async def on_shutdown(app: Application) -> None:
@@ -648,7 +732,7 @@ async def on_shutdown(app: Application) -> None:
         await pyro.stop()
     except Exception:
         pass
-    logger.info("Pyrogram client stopped.")
+    logger.info("Pyrogram stopped.")
 
 def main() -> None:
     app = (
@@ -677,6 +761,7 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
+
     logger.info("Bot started.")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
