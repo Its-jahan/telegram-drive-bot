@@ -50,14 +50,30 @@ GDRIVE_FOLDER = os.environ.get("GDRIVE_FOLDER",       "TelegramDownloads")
 TOKEN_FILE    = Path(os.environ.get("TOKEN_FILE",      "/opt/dlbot/gdrive_token.json"))
 SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE",  "/opt/dlbot/deletions.json"))
 USERS_FILE    = Path(os.environ.get("USERS_FILE",      "/opt/dlbot/users.json"))
+VIP_FILE      = Path(os.environ.get("VIP_FILE",        "/opt/dlbot/vip.json"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
+GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY",      "")
 OAUTH_PORT    = int(os.environ.get("OAUTH_PORT",       "8888"))
 REDIRECT_URI  = f"http://{SERVER_IP}:{OAUTH_PORT}"
 HEALTH_PORT   = int(os.environ.get("HEALTH_PORT",      "9102"))
 
 SCOPES = ["https://www.googleapis.com/auth/drive.file"]
-URL_RE = re.compile(r"https?://[^\s]+|magnet:\?[^\s]+", re.IGNORECASE)
+URL_RE = re.compile(r"(?:https?|ftp)://[^\s]+|magnet:\?[^\s]+", re.IGNORECASE)
+
+# ── Blocked content keywords (VPN / proxy tools) ──────────────────────────────
+_BLOCKED_KEYWORDS = re.compile(
+    r"v2ray|v2rayn|v2rayng|xray|clash|shadowsocks|trojan|wireguard|outline"
+    r"|vpn|proxy|tunnel|hysteria|sing.?box|naiveproxy|brook|mtproto"
+    r"|ss-local|ssr|shadowsocksr|quantumult|surge|stash|nekoray|hiddify",
+    re.IGNORECASE,
+)
+_BLOCKED_REPLY = (
+    "⛔️ با توجه به محدودیت‌های گوگل و ریسک بن شدن، نمی‌تونیم این فایل رو قبول کنیم."
+)
+
+def _is_blocked(text: str) -> bool:
+    return bool(_BLOCKED_KEYWORDS.search(text))
 
 MAX_FILE_MB         = 800    # Hard cap for users
 TG_BOT_API_LIMIT_MB = 20     # Bot API hard cap; above this → Pyrogram
@@ -84,13 +100,19 @@ DURATIONS = {
 }
 
 # message_id → pending data
-_pending_urls:  dict[int, str]  = {}
+_pending_urls:  dict[int, dict] = {}   # {url, user_id, is_vip}
 _pending_files: dict[int, dict] = {}
 
 # task_id → live task state shown in health page
 # task_id = f"{chat_id}:{msg_id}"
 _tasks: dict[str, dict] = {}
 # status values: "waiting" | "downloading" | "uploading" | "done" | "error" | "timeout"
+
+# Ordered list of task_ids waiting for DOWNLOAD_SEMAPHORE — used for queue position display
+_download_queue: list[str] = []
+
+# task_id → asyncio.Task reference, so we can cancel them from the health page
+_active_tasks: dict[str, asyncio.Task] = {}
 
 # ── Pyrogram (MTProto, large-file support) ────────────────────────────────────
 API_ID   = int(os.environ["TG_API_ID"])
@@ -149,6 +171,52 @@ def register_user(user) -> None:
             USERS_FILE.write_text(json.dumps(users, ensure_ascii=False, indent=2))
     except Exception:
         pass
+
+# ── VIP registry ─────────────────────────────────────────────────────────────
+
+def load_vip() -> dict:
+    if VIP_FILE.exists():
+        try:
+            return json.loads(VIP_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_vip(data: dict) -> None:
+    VIP_FILE.write_text(json.dumps(data, indent=2))
+
+def get_vip_credits(user_id: int) -> int:
+    return load_vip().get(str(user_id), 0)
+
+def consume_vip_credit(user_id: int) -> int:
+    """Use one VIP credit. Returns credits remaining after consumption."""
+    data = load_vip()
+    uid  = str(user_id)
+    if uid not in data or data[uid] <= 0:
+        return 0
+    data[uid] -= 1
+    if data[uid] <= 0:
+        del data[uid]
+    save_vip(data)
+    return data.get(uid, 0)
+
+# ── ETA helper ────────────────────────────────────────────────────────────────
+
+def _fmt_eta(start_ts: float, pct: int) -> str:
+    """Returns '~2m 30s remaining' given phase start time and current percent."""
+    if pct <= 1:
+        return ""
+    elapsed = time.time() - start_ts
+    if elapsed < 3:
+        return ""
+    remaining = elapsed / pct * (100 - pct)
+    if remaining <= 0:
+        return ""
+    h, r  = divmod(int(remaining), 3600)
+    m, s  = divmod(r, 60)
+    if h:
+        return f"~{h}h {m}m remaining"
+    return f"~{m}m {s}s remaining" if m else f"~{s}s remaining"
 
 # ── Google Drive helpers ──────────────────────────────────────────────────────
 
@@ -223,7 +291,12 @@ async def upload_to_drive(path: Path, on_progress=None) -> tuple[str, str]:
         service.permissions().create(
             fileId=file_id, body={"type": "anyone", "role": "reader"}
         ).execute()
-        return file_id, f"https://drive.google.com/file/d/{file_id}/view?usp=sharing"
+        # Direct googleapis.com download — accessible in Iran
+        if GOOGLE_API_KEY:
+            download_url = f"https://www.googleapis.com/drive/v3/files/{file_id}?alt=media&key={GOOGLE_API_KEY}"
+        else:
+            download_url = f"https://drive.usercontent.google.com/download?id={file_id}&export=download&authuser=0"
+        return file_id, download_url
 
     if path.is_file():
         return await asyncio.to_thread(_do_upload, path)
@@ -302,9 +375,26 @@ async def _local_janitor() -> None:
         except Exception as e:
             logger.warning("Janitor error: %s", e)
 
+async def _resume_one_deletion(file_id: str, filename: str, remaining: float) -> None:
+    """Sleep then delete — does NOT re-add to the schedule file (avoids duplication)."""
+    await asyncio.sleep(max(remaining, 0))
+    await delete_drive_file(file_id)
+    remove_scheduled_deletion(file_id)
+
 async def resume_pending_deletions(app: Application) -> None:
     """Re-schedule deletions that survived a restart. Never blocks startup."""
-    entries = load_schedule()
+    raw     = load_schedule()
+    # Deduplicate by file_id — keep the entry with the latest delete_at
+    seen: dict[str, dict] = {}
+    for entry in raw:
+        fid = entry["file_id"]
+        if fid not in seen or entry["delete_at"] > seen[fid]["delete_at"]:
+            seen[fid] = entry
+    entries = list(seen.values())
+    if len(entries) != len(raw):
+        save_schedule(entries)   # write back deduplicated list
+        logger.info("Deduplicated deletions.json: %d → %d entries", len(raw), len(entries))
+
     now = time.time()
     overdue = resumed = 0
     for entry in entries:
@@ -313,9 +403,9 @@ async def resume_pending_deletions(app: Application) -> None:
             asyncio.create_task(_delete_and_remove(entry["file_id"], entry["filename"]))
             overdue += 1
         else:
+            # Use _resume_one_deletion — never re-adds to the file
             asyncio.create_task(
-                schedule_deletion(entry["file_id"], entry["filename"],
-                                  int(remaining), app.bot, 0)
+                _resume_one_deletion(entry["file_id"], entry["filename"], remaining)
             )
             resumed += 1
     if overdue or resumed:
@@ -425,8 +515,72 @@ async def cmd_users(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("⛔ Admin only.")
         return
     users = load_users()
-    await update.message.reply_text(
-        f"👥 Total registered users: *{len(users)}*", parse_mode="Markdown"
+    vip   = load_vip()
+    lines = [f"👥 *Registered users: {len(users)}*\n"]
+    for uid, info in list(users.items())[-30:]:   # last 30
+        vip_tag = f" 🌟 VIP×{vip[uid]}" if uid in vip else ""
+        name    = info.get("name", "?")
+        lines.append(f"`{uid}` — {name}{vip_tag}")
+    await update.message.reply_text("\n".join(lines), parse_mode="Markdown")
+
+async def cmd_vip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user = update.effective_user
+    if not ADMIN_IDS or user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    args = context.args
+    if len(args) < 2:
+        vip_data = load_vip()
+        if vip_data:
+            entries = "\n".join(f"`{uid}` — {c} credit(s)" for uid, c in vip_data.items())
+        else:
+            entries = "_None_"
+        await update.message.reply_text(
+            "📋 *Current VIP users:*\n" + entries + "\n\n"
+            "Usage: `/vip <user_id> <credits>`\n"
+            "Example: `/vip 123456789 3`\n"
+            "Set credits to *0* to remove VIP.\n\n"
+            "✅ VIP bypasses: size limit, 5-min timeout (30 min instead)\n"
+            "Use /users to see user IDs.",
+            parse_mode="Markdown",
+        )
+        return
+    try:
+        target_id = int(args[0].lstrip("@"))
+        credits   = int(args[1])
+    except ValueError:
+        await update.message.reply_text("❌ Use: `/vip 123456789 3`", parse_mode="Markdown")
+        return
+
+    data = load_vip()
+    if credits <= 0:
+        data.pop(str(target_id), None)
+        save_vip(data)
+        await update.message.reply_text(
+            f"✅ VIP removed for user `{target_id}`.", parse_mode="Markdown"
+        )
+    else:
+        data[str(target_id)] = credits
+        save_vip(data)
+        await update.message.reply_text(
+            f"🌟 *VIP granted!*\n"
+            f"👤 User ID: `{target_id}`\n"
+            f"🎟 Credits: *{credits}* file(s)\n"
+            f"📦 No size limit · ⏱ 30-min timeout per file",
+            parse_mode="Markdown",
+        )
+
+async def handle_dl_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    await query.message.reply_text(
+        "برای اینکه بتونید فایل رو از متود دوم \\(دانلود مستقیم\\) دانلود کنید\n"
+        "باید از سرویس پولی شکن استفاده کنید تا بتونید دانلود کنید\n"
+        "[shecan\\.ir](http://shecan.ir)\n\n"
+        "درصورتی که سوالی داشتید به من پیام بدین\n"
+        "@ImJahan",
+        parse_mode="MarkdownV2",
+        disable_web_page_preview=False,
     )
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -438,8 +592,45 @@ async def run_cmd(cmd: list[str]) -> tuple[int, str, str]:
     out, err = await proc.communicate()
     return proc.returncode, out.decode(), err.decode()
 
+def _strip_ftp_creds(url: str) -> tuple[str, str | None, str | None]:
+    """Extract user/pass from ftp://user:pass@host/path and return clean url + creds."""
+    import urllib.parse
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme.lower() == "ftp" and parsed.username:
+        clean = parsed._replace(netloc=parsed.hostname +
+                                (f":{parsed.port}" if parsed.port else "")).geturl()
+        return clean, parsed.username, parsed.password
+    return url, None, None
+
+async def get_url_size_mb(url: str) -> float | None:
+    """HEAD request to get Content-Length without downloading. Returns MB or None."""
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "curl", "-sI", "--max-time", "10",
+            "--user-agent", "Mozilla/5.0",
+            "-L", url,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        out, _ = await proc.communicate()
+        for line in out.decode(errors="ignore").splitlines():
+            if line.lower().startswith("content-length:"):
+                size_bytes = int(line.split(":", 1)[1].strip())
+                return size_bytes / (1024 * 1024)
+    except Exception:
+        pass
+    return None
+
 async def run_aria2(url: str, dest_dir: Path, on_progress=None) -> tuple[int, str, str]:
-    """Run aria2c and stream stderr so on_progress(0-100) is called in real-time."""
+    """Run aria2c and stream stderr so on_progress(0-100) is called in real-time.
+    Handles ftp://user:pass@host/path by stripping creds into separate flags."""
+    clean_url, ftp_user, ftp_pass = _strip_ftp_creds(url)
+    extra: list[str] = []
+    if ftp_user:
+        extra += ["--ftp-user", ftp_user]
+    if ftp_pass:
+        extra += ["--ftp-passwd", ftp_pass]
+
     proc = await asyncio.create_subprocess_exec(
         "aria2c",
         "--dir", str(dest_dir),
@@ -450,7 +641,8 @@ async def run_aria2(url: str, dest_dir: Path, on_progress=None) -> tuple[int, st
         "--auto-file-renaming=true",
         "--console-log-level=notice",   # enables progress lines on stderr
         "--summary-interval=1",         # print progress every second
-        url,
+        *extra,
+        clean_url,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -491,6 +683,21 @@ async def ensure_pyro() -> None:
 
 # ── URL handler ───────────────────────────────────────────────────────────────
 
+def _safe_display_url(url: str) -> str:
+    """Return URL with password replaced by *** for display in Telegram."""
+    import urllib.parse
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.password:
+            masked = p._replace(
+                netloc=f"{p.username}:***@{p.hostname}" +
+                       (f":{p.port}" if p.port else "")
+            ).geturl()
+            return masked
+    except Exception:
+        pass
+    return url
+
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_user(update.effective_user)
     text  = update.message.text or ""
@@ -502,13 +709,27 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
         return
 
-    url = match.group(0)
+    url          = match.group(0)
+    display_url  = _safe_display_url(url)
+
+    if _is_blocked(url):
+        await update.message.reply_text(_BLOCKED_REPLY)
+        return
+
+    vip_credits  = get_vip_credits(update.effective_user.id)
+    is_vip       = vip_credits > 0
+    vip_tag      = f"\n🌟 *VIP* — {vip_credits} credit(s) remaining" if is_vip else ""
+
     msg = await update.message.reply_text(
-        f"🔗 Link received!\n`{url[:80]}`\n\nHow long should this file be stored on Google Drive?",
+        f"🔗 Link received!\n`{display_url[:80]}`{vip_tag}\n\nHow long should this file be stored on Google Drive?",
         parse_mode="Markdown",
         reply_markup=_duration_keyboard(),
     )
-    _pending_urls[msg.message_id] = url
+    _pending_urls[msg.message_id] = {
+        "url":     url,
+        "user_id": update.effective_user.id,
+        "is_vip":  is_vip,
+    }
 
 # ── File/forward handler ──────────────────────────────────────────────────────
 
@@ -540,9 +761,15 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     else:
         return
 
-    size_mb = (tg_obj.file_size or 0) / (1024 * 1024)
+    size_mb    = (tg_obj.file_size or 0) / (1024 * 1024)
+    vip_credits = get_vip_credits(update.effective_user.id)
+    is_vip      = vip_credits > 0
 
-    if size_mb > MAX_FILE_MB:
+    if _is_blocked(fname):
+        await msg.reply_text(_BLOCKED_REPLY)
+        return
+
+    if size_mb > MAX_FILE_MB and not is_vip:
         await msg.reply_text(
             f"❌ File is too large ({size_mb:.0f} MB).\n"
             f"Maximum supported size is *{MAX_FILE_MB} MB*.",
@@ -553,10 +780,11 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     is_forwarded = msg.forward_origin is not None or msg.forward_date is not None
     source_tag   = "📨 Forwarded file" if is_forwarded else "📎 File received"
     method_tag   = "📡 MTProto (Pyrogram)" if size_mb > TG_BOT_API_LIMIT_MB else "⚡ Bot API"
+    vip_tag      = f"\n🌟 *VIP* — {vip_credits} credit(s) remaining" if is_vip else ""
 
     prompt = await msg.reply_text(
         f"{source_tag}: `{fname}`\n"
-        f"📦 Size: {size_mb:.1f} MB  |  Download via: {method_tag}\n\n"
+        f"📦 Size: {size_mb:.1f} MB  |  Download via: {method_tag}{vip_tag}\n\n"
         "How long should this file be stored on Google Drive?",
         parse_mode="Markdown",
         reply_markup=_duration_keyboard(),
@@ -567,6 +795,8 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         "msg_id":     msg.message_id,
         "filename":   fname,
         "size_mb":    size_mb,
+        "user_id":    update.effective_user.id,
+        "is_vip":     is_vip,
     }
 
 # ── Duration picker → dispatch background task ────────────────────────────────
@@ -583,17 +813,23 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     label, seconds = DURATIONS[key]
     msg_id = query.message.message_id
 
-    url       = _pending_urls.pop(msg_id, None)
+    url_info  = _pending_urls.pop(msg_id, None)
     file_info = _pending_files.pop(msg_id, None)
 
-    if not url and not file_info:
+    if not url_info and not file_info:
         await query.edit_message_text("⚠️ Session expired. Please send the file/link again.")
         return
+
+    url     = url_info["url"]     if url_info  else None
+    is_vip  = (url_info or file_info or {}).get("is_vip",  False)
+    user_id = (url_info or file_info or {}).get("user_id", None)
 
     fname   = file_info["filename"] if file_info else (url.split("/")[-1].split("?")[0] or url[:40])
     size_mb = file_info["size_mb"]  if file_info else None
     chat_id = update.effective_chat.id
     task_id = f"{chat_id}:{msg_id}"
+
+    vip_tag = " 🌟 VIP" if is_vip else ""
 
     # Register task immediately so health page shows it as "waiting"
     _tasks[task_id] = {
@@ -603,17 +839,18 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         "pct":        0,
         "started_at": time.time(),
         "label":      label,
+        "is_vip":     is_vip,
     }
 
     # Acknowledge immediately so PTB is free for the next user
     await query.edit_message_text(
-        "⏳ Queued! Starting download…\n"
+        f"⏳ Queued{vip_tag}! Starting download…\n"
         f"🗑 Will be deleted after *{label}*\n\n"
         "_(you'll see progress updates here)_",
         parse_mode="Markdown",
     )
 
-    asyncio.create_task(
+    _active_tasks[task_id] = asyncio.create_task(
         _run_with_timeout(
             task_id=task_id,
             bot=context.bot,
@@ -623,27 +860,47 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             file_info=file_info,
             label=label,
             seconds=seconds,
+            is_vip=is_vip,
+            user_id=user_id,
         )
     )
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
-async def _run_with_timeout(task_id, bot, chat_id, msg_id, url, file_info, label, seconds):
-    """Wraps the actual work with a 5-minute timeout."""
+async def _run_with_timeout(task_id, bot, chat_id, msg_id, url, file_info, label, seconds,
+                            is_vip=False, user_id=None):
+    """Wraps the actual work with a timeout (30 min for VIP, 5 min normal)."""
+    effective_timeout = 1800 if is_vip else REQUEST_TIMEOUT
     try:
         await asyncio.wait_for(
-            _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds),
-            timeout=REQUEST_TIMEOUT,
+            _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds,
+                                is_vip=is_vip, user_id=user_id),
+            timeout=effective_timeout,
         )
+    except asyncio.CancelledError:
+        # Killed via the health-page "Kill All" button
+        _tasks.pop(task_id, None)
+        _active_tasks.pop(task_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text="🛑 *Download cancelled* by admin.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        return
     except asyncio.TimeoutError:
         if task_id in _tasks:
             _tasks[task_id]["status"] = "timeout"
         asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        _active_tasks.pop(task_id, None)
         try:
+            limit_str = "30 minutes" if is_vip else "5 minutes"
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id,
                 text=(
-                    "⏰ *Request timed out* after 5 minutes.\n\n"
+                    f"⏰ *Request timed out* after {limit_str}.\n\n"
                     "The file may be too large or the server is busy.\n"
                     "Please send it again."
                 ),
@@ -655,6 +912,7 @@ async def _run_with_timeout(task_id, bot, chat_id, msg_id, url, file_info, label
         if task_id in _tasks:
             _tasks[task_id]["status"] = "error"
         asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        _active_tasks.pop(task_id, None)
         logger.exception("Unhandled error in _do_download_upload")
         try:
             await bot.edit_message_text(
@@ -663,8 +921,11 @@ async def _run_with_timeout(task_id, bot, chat_id, msg_id, url, file_info, label
             )
         except Exception:
             pass
+    else:
+        _active_tasks.pop(task_id, None)
 
-async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds):
+async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, label, seconds,
+                              is_vip=False, user_id=None):
     """The actual download + Drive upload logic, runs inside a timeout."""
 
     def _task_set(status: str, pct: int = 0, filename: str | None = None) -> None:
@@ -674,11 +935,12 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
             if filename:
                 _tasks[task_id]["filename"] = filename
 
-    async def _edit(text: str) -> None:
+    async def _edit(text: str, reply_markup=None) -> None:
         try:
             await bot.edit_message_text(
                 chat_id=chat_id, message_id=msg_id,
                 text=text, parse_mode="Markdown",
+                reply_markup=reply_markup,
             )
         except Exception:
             pass
@@ -686,7 +948,6 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
     DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
     _health["last_activity"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
 
-    # ── Branch A: URL ─────────────────────────────────────────────────────────
     # Throttle Telegram message edits — max 1 per 3 s to avoid flood limits
     _last_edit_ts = [0.0]
     async def _edit_throttled(text: str, force: bool = False) -> None:
@@ -696,196 +957,275 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
         _last_edit_ts[0] = now
         await _edit(text)
 
-    if url:
-        _task_set("downloading")
-        await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
+    # ── Queue tracking ────────────────────────────────────────────────────────
+    vip_badge = " 🌟" if is_vip else ""
+    _download_queue.append(task_id)
 
-        async def _dl_prog(pct: int) -> None:
-            _task_set("downloading", pct)
-            await _edit_throttled(
-                f"📥 Downloading…\n`{url[:60]}`\n\n"
-                f"`{_make_bar(pct)}` {pct}%\n\n"
-                f"🗑 Will be deleted after *{label}*"
-            )
-
-        _health["active_downloads"] += 1
-        async with DOWNLOAD_SEMAPHORE:
-            rc, stdout, stderr = await run_aria2(url, DOWNLOAD_DIR, on_progress=_dl_prog)
-
-        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
-        if rc != 0:
-            _task_set("error")
-            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-            await _edit(f"❌ Download failed:\n```{(stderr or stdout)[:400]}```")
-            return
-
-        items = sorted(DOWNLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
-        if not items:
-            _task_set("error")
-            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-            await _edit("❌ Download finished but no file found.")
-            return
-
-        downloaded = items[0]
-        size_mb = (
-            downloaded.stat().st_size if downloaded.is_file()
-            else sum(f.stat().st_size for f in downloaded.rglob("*") if f.is_file())
-        ) / (1024 * 1024)
-
-        if size_mb > MAX_FILE_MB:
-            try:
-                shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
-            except Exception:
-                pass
-            _task_set("error")
-            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-            await _edit(
-                f"❌ Downloaded file is too large ({size_mb:.0f} MB).\n"
-                f"Maximum is *{MAX_FILE_MB} MB*."
-            )
-            return
-
-        fname = downloaded.name
-        _task_set("uploading", 0, fname)
-        if task_id in _tasks:
-            _tasks[task_id]["size_mb"] = size_mb
-        await _edit(
-            f"✅ Downloaded `{fname}` ({size_mb:.1f} MB)\n"
-            f"☁️ Uploading to Google Drive…\n\n"
-            f"🗑 Will be deleted after *{label}*"
-        )
-
-        try:
-            async def _prog(pct: int) -> None:
-                _task_set("uploading", pct)
-                await _edit(
-                    f"☁️ Uploading `{fname}` to Google Drive…\n\n"
-                    f"`{_make_bar(pct)}` {pct}%\n\n"
+    async def _queue_watcher() -> None:
+        """Periodically update the user with their queue position."""
+        wait_start = time.time()
+        while task_id in _download_queue:
+            pos   = _download_queue.index(task_id) + 1 if task_id in _download_queue else 1
+            total = len(_download_queue)
+            if pos > 1 or (time.time() - wait_start) > 5:
+                await _edit_throttled(
+                    f"⏳ Waiting for a download slot{vip_badge}…\n"
+                    f"📊 Your position in queue: *{pos}* of {total}\n\n"
                     f"🗑 Will be deleted after *{label}*"
                 )
-            drive_file_id, link = await upload_to_drive(downloaded, on_progress=_prog)
-        except Exception as e:
-            _task_set("error")
-            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-            await _edit(f"❌ Upload failed: {e}")
-            return
-        finally:
-            try:
-                shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
-            except Exception:
-                pass
+            await asyncio.sleep(4)
 
-        size_mb_final = size_mb
+    _watcher = asyncio.create_task(_queue_watcher())
 
-    # ── Branch B: Telegram file ───────────────────────────────────────────────
-    else:
-        fname   = file_info["filename"]
-        size_mb = file_info["size_mb"]
-
-        _task_set("downloading", 0, fname)
-        await _edit(
-            f"📥 Fetching `{fname}` from Telegram…\n\n"
-            f"`{_make_bar(0)}` 0%\n\n"
-            f"🗑 Will be deleted after *{label}*"
-        )
-
-        local_path = DOWNLOAD_DIR / fname
-        size_bytes = int(size_mb * 1024 * 1024)
-
-        async def _fetch_prog(pct: int) -> None:
-            _task_set("downloading", pct)
-            await _edit_throttled(
-                f"📥 Fetching `{fname}` from Telegram…\n\n"
-                f"`{_make_bar(pct)}` {pct}%\n\n"
-                f"🗑 Will be deleted after *{label}*"
-            )
-
-        _health["active_downloads"] += 1
-        async with DOWNLOAD_SEMAPHORE:
-            try:
-                if size_mb > TG_BOT_API_LIMIT_MB:
-                    # Pyrogram has a native progress callback
-                    await ensure_pyro()
-                    pyro_msg = await pyro.get_messages(
-                        file_info["chat_id"], file_info["msg_id"]
-                    )
-
-                    async def _pyro_cb(current: int, total: int) -> None:
-                        pct = int(current / total * 100) if total else 0
-                        await _fetch_prog(pct)
-
-                    await pyro.download_media(
-                        pyro_msg,
-                        file_name=str(local_path),
-                        progress=_pyro_cb,
-                    )
-                else:
-                    # Bot API: poll file size on disk while downloading
-                    tg_file = await bot.get_file(file_info["tg_file_id"])
-                    dl_task  = asyncio.create_task(
-                        tg_file.download_to_drive(str(local_path))
-                    )
-                    while not dl_task.done():
-                        try:
-                            current = local_path.stat().st_size if local_path.exists() else 0
-                            pct = int(current / size_bytes * 100) if size_bytes else 0
-                            await _fetch_prog(min(pct, 99))
-                        except Exception:
-                            pass
-                        await asyncio.sleep(0.4)
-                    await dl_task   # re-raise any exception
-            except Exception as e:
-                _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+    try:
+        # ── Branch A: URL ─────────────────────────────────────────────────────
+        if url:
+            # Pre-flight size check — avoid downloading a 10 GB file just to reject it
+            _task_set("downloading")
+            await _edit(f"🔍 Checking file size…\n`{url[:80]}`")
+            pre_size_mb = await get_url_size_mb(url)
+            if pre_size_mb and pre_size_mb > MAX_FILE_MB and not is_vip:
                 _task_set("error")
                 asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-                await _edit(f"❌ Failed to fetch file from Telegram: {e}")
-                return
-        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
-
-        _task_set("uploading", 0)
-        await _edit(
-            f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
-            f"☁️ Uploading to Google Drive…\n\n"
-            f"🗑 Will be deleted after *{label}*"
-        )
-
-        try:
-            async def _prog(pct: int) -> None:
-                _task_set("uploading", pct)
                 await _edit(
-                    f"☁️ Uploading `{fname}` to Google Drive…\n\n"
-                    f"`{_make_bar(pct)}` {pct}%\n\n"
+                    f"❌ File is too large ({pre_size_mb:.0f} MB).\n"
+                    f"Maximum is *{MAX_FILE_MB} MB*.\n\n"
+                    f"_(checked before downloading — no bandwidth wasted)_"
+                )
+                return
+
+            await _edit(f"📥 Downloading…\n`{url[:80]}`\n\n🗑 Will be deleted after *{label}*")
+            _dl_start = time.time()
+
+            async def _dl_prog(pct: int) -> None:
+                _task_set("downloading", pct)
+                eta = _fmt_eta(_dl_start, pct)
+                eta_line = f"\n⏱ {eta}" if eta else ""
+                await _edit_throttled(
+                    f"📥 Downloading{vip_badge}…\n`{url[:60]}`\n\n"
+                    f"`{_make_bar(pct)}` {pct}%{eta_line}\n\n"
                     f"🗑 Will be deleted after *{label}*"
                 )
-            drive_file_id, link = await upload_to_drive(local_path, on_progress=_prog)
-        except Exception as e:
-            _task_set("error")
-            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
-            await _edit(f"❌ Upload failed: {e}")
-            return
-        finally:
+
+            _health["active_downloads"] += 1
+            async with DOWNLOAD_SEMAPHORE:
+                if task_id in _download_queue:
+                    _download_queue.remove(task_id)
+                rc, stdout, stderr = await run_aria2(url, DOWNLOAD_DIR, on_progress=_dl_prog)
+
+            _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+            if rc != 0:
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                await _edit(f"❌ Download failed:\n```{(stderr or stdout)[:400]}```")
+                return
+
+            items = sorted(DOWNLOAD_DIR.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+            if not items:
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                await _edit("❌ Download finished but no file found.")
+                return
+
+            downloaded = items[0]
+            size_mb = (
+                downloaded.stat().st_size if downloaded.is_file()
+                else sum(f.stat().st_size for f in downloaded.rglob("*") if f.is_file())
+            ) / (1024 * 1024)
+
+            if size_mb > MAX_FILE_MB and not is_vip:
+                try:
+                    shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
+                except Exception:
+                    pass
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                await _edit(
+                    f"❌ Downloaded file is too large ({size_mb:.0f} MB).\n"
+                    f"Maximum is *{MAX_FILE_MB} MB*."
+                )
+                return
+
+            fname = downloaded.name
+            _task_set("uploading", 0, fname)
+            if task_id in _tasks:
+                _tasks[task_id]["size_mb"] = size_mb
+            await _edit(
+                f"✅ Downloaded `{fname}` ({size_mb:.1f} MB)\n"
+                f"☁️ Uploading to Google Drive…\n\n"
+                f"🗑 Will be deleted after *{label}*"
+            )
+            _up_start = time.time()
+
             try:
-                local_path.unlink(missing_ok=True)
-            except Exception:
-                pass
+                async def _prog_a(pct: int) -> None:
+                    _task_set("uploading", pct)
+                    eta = _fmt_eta(_up_start, pct)
+                    eta_line = f"\n⏱ {eta}" if eta else ""
+                    await _edit_throttled(
+                        f"☁️ Uploading `{fname}` to Google Drive{vip_badge}…\n\n"
+                        f"`{_make_bar(pct)}` {pct}%{eta_line}\n\n"
+                        f"🗑 Will be deleted after *{label}*"
+                    )
+                drive_file_id, link = await upload_to_drive(downloaded, on_progress=_prog_a)
+            except Exception as e:
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                await _edit(f"❌ Upload failed: {e}")
+                return
+            finally:
+                try:
+                    shutil.rmtree(downloaded) if downloaded.is_dir() else downloaded.unlink()
+                except Exception:
+                    pass
 
-        size_mb_final = size_mb
+            size_mb_final = size_mb
 
-    # ── Done ──────────────────────────────────────────────────────────────────
-    _task_set("done", 100)
-    asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
-    _health["total_uploads"] += 1
-    await _edit(
-        f"✅ *Done!*\n\n"
-        f"📁 `{fname}`\n"
-        f"📦 {size_mb_final:.1f} MB\n"
-        f"🗑 Auto-delete in: *{label}*\n\n"
-        f"🔗 [Open in Google Drive]({link})"
-    )
+        # ── Branch B: Telegram file ───────────────────────────────────────────
+        else:
+            fname   = file_info["filename"]
+            size_mb = file_info["size_mb"]
 
-    asyncio.create_task(
-        schedule_deletion(drive_file_id, fname, seconds, bot, chat_id)
-    )
+            _task_set("downloading", 0, fname)
+            await _edit(
+                f"📥 Fetching `{fname}` from Telegram{vip_badge}…\n\n"
+                f"`{_make_bar(0)}` 0%\n\n"
+                f"🗑 Will be deleted after *{label}*"
+            )
+
+            local_path = DOWNLOAD_DIR / fname
+            size_bytes = int(size_mb * 1024 * 1024)
+            _dl_start  = time.time()
+
+            async def _fetch_prog(pct: int) -> None:
+                _task_set("downloading", pct)
+                eta = _fmt_eta(_dl_start, pct)
+                eta_line = f"\n⏱ {eta}" if eta else ""
+                await _edit_throttled(
+                    f"📥 Fetching `{fname}` from Telegram{vip_badge}…\n\n"
+                    f"`{_make_bar(pct)}` {pct}%{eta_line}\n\n"
+                    f"🗑 Will be deleted after *{label}*"
+                )
+
+            _health["active_downloads"] += 1
+            async with DOWNLOAD_SEMAPHORE:
+                if task_id in _download_queue:
+                    _download_queue.remove(task_id)
+                try:
+                    if size_mb > TG_BOT_API_LIMIT_MB:
+                        await ensure_pyro()
+                        pyro_msg = await pyro.get_messages(
+                            file_info["chat_id"], file_info["msg_id"]
+                        )
+
+                        async def _pyro_cb(current: int, total: int) -> None:
+                            pct = int(current / total * 100) if total else 0
+                            await _fetch_prog(pct)
+
+                        await pyro.download_media(
+                            pyro_msg,
+                            file_name=str(local_path),
+                            progress=_pyro_cb,
+                        )
+                    else:
+                        tg_file = await bot.get_file(file_info["tg_file_id"])
+                        dl_task = asyncio.create_task(
+                            tg_file.download_to_drive(str(local_path))
+                        )
+                        while not dl_task.done():
+                            try:
+                                current = local_path.stat().st_size if local_path.exists() else 0
+                                pct = int(current / size_bytes * 100) if size_bytes else 0
+                                await _fetch_prog(min(pct, 99))
+                            except Exception:
+                                pass
+                            await asyncio.sleep(0.4)
+                        await dl_task
+                except Exception as e:
+                    _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+                    _task_set("error")
+                    asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                    await _edit(f"❌ Failed to fetch file from Telegram: {e}")
+                    return
+            _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+
+            _task_set("uploading", 0)
+            await _edit(
+                f"✅ Got `{fname}` ({size_mb:.1f} MB)\n"
+                f"☁️ Uploading to Google Drive…\n\n"
+                f"🗑 Will be deleted after *{label}*"
+            )
+            _up_start = time.time()
+
+            try:
+                async def _prog_b(pct: int) -> None:
+                    _task_set("uploading", pct)
+                    eta = _fmt_eta(_up_start, pct)
+                    eta_line = f"\n⏱ {eta}" if eta else ""
+                    await _edit_throttled(
+                        f"☁️ Uploading `{fname}` to Google Drive{vip_badge}…\n\n"
+                        f"`{_make_bar(pct)}` {pct}%{eta_line}\n\n"
+                        f"🗑 Will be deleted after *{label}*"
+                    )
+                drive_file_id, link = await upload_to_drive(local_path, on_progress=_prog_b)
+            except Exception as e:
+                _task_set("error")
+                asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+                await _edit(f"❌ Upload failed: {e}")
+                return
+            finally:
+                try:
+                    local_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+            size_mb_final = size_mb
+
+        # ── Done ──────────────────────────────────────────────────────────────
+        _task_set("done", 100)
+        asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
+        _health["total_uploads"] += 1
+
+        # VIP: consume one credit and tell the user how many remain
+        vip_note = ""
+        if is_vip and user_id:
+            remaining = consume_vip_credit(user_id)
+            vip_note = (
+                f"\n🌟 VIP credit used · *{remaining}* credit(s) left"
+                if remaining > 0
+                else "\n🌟 VIP credits used up — normal limits now apply"
+            )
+
+        drive_view   = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
+        api_link     = (
+            f"https://www.googleapis.com/drive/v3/files/{drive_file_id}"
+            f"?alt=media&key={GOOGLE_API_KEY}"
+            if GOOGLE_API_KEY else drive_view
+        )
+        help_keyboard = InlineKeyboardMarkup([[
+            InlineKeyboardButton("در دانلود مشکل دارید؟ 🔧", callback_data="dlhelp")
+        ]])
+        await _edit(
+            f"✅ *Done!*{vip_badge}\n\n"
+            f"📁 `{fname}`\n"
+            f"📦 {size_mb_final:.1f} MB\n"
+            f"🗑 Auto-delete in: *{label}*{vip_note}\n\n"
+            f"1️⃣ [گوگل درایو]({drive_view})\n"
+            f"2️⃣ [دانلود مستقیم]({api_link})\n\n"
+            f"دقت کنید متود دوم (دانلود مستقیم) تست شده و برای تمامی اینترنت‌هایی که شکن فعال دارن کار می‌کنه\n"
+            f"درصورتی که شکن رو فعال کردین و کار نکرد لطفاً حتماً بهم اطلاع بدین تا اگر غیرفعال شده باشه تست کنم و متود رو غیرفعال کنیم",
+            reply_markup=help_keyboard,
+        )
+
+        asyncio.create_task(
+            schedule_deletion(drive_file_id, fname, seconds, bot, chat_id)
+        )
+
+    finally:
+        # Always clean up the queue entry and watcher, even on exceptions
+        if task_id in _download_queue:
+            _download_queue.remove(task_id)
+        _watcher.cancel()
 
 # ── Health-check HTTP server ──────────────────────────────────────────────────
 
@@ -1039,6 +1379,26 @@ def _health_html() -> str:
 <body>
 <h1>🤖 Telegram → Google Drive Bot</h1>
 <p class="sub">Auto-refreshes every 5 s &nbsp;·&nbsp; Uptime: {_uptime_str()}</p>
+
+<div style="display:flex;gap:10px;flex-wrap:wrap;margin-bottom:20px">
+  <form method="POST" action="/restart"
+        onsubmit="return confirm('Restart the bot service now?')">
+    <button type="submit"
+            style="background:#e74c3c;color:#fff;border:none;border-radius:8px;
+                   padding:10px 22px;font-size:.95rem;font-weight:600;cursor:pointer">
+      🔄 Restart Bot
+    </button>
+  </form>
+  <form method="POST" action="/killall"
+        onsubmit="return confirm('Kill ALL downloads and wipe tmp files?\\nUsers will be notified their download was cancelled.')">
+    <button type="submit"
+            style="background:#e67e22;color:#fff;border:none;border-radius:8px;
+                   padding:10px 22px;font-size:.95rem;font-weight:600;cursor:pointer">
+      🛑 Kill All Downloads
+    </button>
+  </form>
+</div>
+
 <div class="grid">
 
   <div class="card">
@@ -1109,11 +1469,134 @@ def _health_html() -> str:
 </body>
 </html>"""
 
+async def _proxy_gdrive_download(writer: asyncio.StreamWriter, file_id: str) -> None:
+    """Stream a Google Drive file to the client via googleapis.com (API key stays server-side)."""
+    import urllib.request
+    import urllib.error
+
+    api_url = (
+        f"https://www.googleapis.com/drive/v3/files/{file_id}"
+        f"?alt=media&key={GOOGLE_API_KEY}"
+    )
+    try:
+        resp = await asyncio.to_thread(urllib.request.urlopen, api_url, None, 30)
+
+        ct = resp.headers.get("Content-Type", "application/octet-stream")
+        cl = resp.headers.get("Content-Length", "")
+        cd = resp.headers.get("Content-Disposition", "attachment")
+
+        hdr = f"HTTP/1.1 200 OK\r\nContent-Type: {ct}\r\n"
+        if cl:
+            hdr += f"Content-Length: {cl}\r\n"
+        hdr += f"Content-Disposition: {cd}\r\nCache-Control: no-cache\r\n\r\n"
+        writer.write(hdr.encode())
+        await writer.drain()
+
+        # Stream in 64 KB chunks — never loads whole file into RAM
+        while True:
+            chunk = await asyncio.to_thread(resp.read, 65536)
+            if not chunk:
+                break
+            writer.write(chunk)
+            await writer.drain()
+
+    except urllib.error.HTTPError as e:
+        writer.write(f"HTTP/1.1 {e.code} {e.reason}\r\n\r\n{e.reason}".encode())
+    except Exception as e:
+        logger.warning("GDrive proxy error for %s: %s", file_id, e)
+        writer.write(b"HTTP/1.1 502 Bad Gateway\r\n\r\nProxy error")
+
 async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
     try:
-        await asyncio.wait_for(reader.read(1024), timeout=5)
-        # Update live flags
-        _health["bot_ok"]  = True   # if we're serving, the event loop is alive
+        raw  = await asyncio.wait_for(reader.read(2048), timeout=5)
+        text = raw.decode(errors="ignore")
+        first_line = text.split("\r\n")[0]
+        parts  = first_line.split(" ")
+        method = parts[0] if parts else "GET"
+        path   = parts[1] if len(parts) > 1 else "/"
+
+        # ── GET /dl/<file_id> — proxy download (hides API key) ───────────────
+        if method == "GET" and path.startswith("/dl/"):
+            file_id = path[4:].split("?")[0].strip("/")
+            if file_id and re.match(r'^[a-zA-Z0-9_-]+$', file_id) and GOOGLE_API_KEY:
+                await _proxy_gdrive_download(writer, file_id)
+            else:
+                writer.write(b"HTTP/1.1 400 Bad Request\r\n\r\nInvalid file ID")
+            return
+
+        # ── POST /killall ─────────────────────────────────────────────────────
+        if method == "POST" and path == "/killall":
+            cancelled = len(_active_tasks)
+            for t in list(_active_tasks.values()):
+                t.cancel()
+            _active_tasks.clear()
+            _download_queue.clear()
+            _tasks.clear()
+            _health["active_downloads"] = 0
+            # Wipe DOWNLOAD_DIR
+            removed_files = 0
+            freed_mb = 0
+            try:
+                for item in list(DOWNLOAD_DIR.iterdir()):
+                    try:
+                        sz = (item.stat().st_size if item.is_file()
+                              else sum(f.stat().st_size for f in item.rglob("*") if f.is_file()))
+                        freed_mb += sz / (1024 * 1024)
+                        shutil.rmtree(item) if item.is_dir() else item.unlink()
+                        removed_files += 1
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            logger.warning("Kill-all: cancelled %d tasks, deleted %d files (%.0f MB freed)",
+                           cancelled, removed_files, freed_mb)
+            resp = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+                b"<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                b"<style>body{background:#0f1117;color:#e0e0e0;font-family:sans-serif;"
+                b"display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+                b".box{text-align:center;max-width:400px}</style></head><body>"
+                b"<div class='box'><div style='font-size:3rem'>&#x1F6D1;</div>"
+                + f"<h2 style='margin-top:16px'>Kill-all executed</h2>"
+                  f"<p style='color:#aaa'>Cancelled <b>{cancelled}</b> task(s) &nbsp;·&nbsp; "
+                  f"Deleted <b>{removed_files}</b> file(s) &nbsp;·&nbsp; "
+                  f"Freed <b>{freed_mb:.0f} MB</b></p>"
+                  f"<p style='color:#555;margin-top:16px'>Redirecting…</p>".encode()
+                + b"<script>setTimeout(()=>location.href='/',3000)</script>"
+                  b"</div></body></html>"
+            )
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            return
+
+        # ── POST /restart ────────────────────────────────────────────────────
+        if method == "POST" and path == "/restart":
+            resp = (
+                b"HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\n\r\n"
+                b"<!DOCTYPE html><html><head>"
+                b"<meta charset='utf-8'>"
+                b"<style>body{background:#0f1117;color:#e0e0e0;font-family:sans-serif;"
+                b"display:flex;align-items:center;justify-content:center;height:100vh;margin:0}"
+                b".box{text-align:center}.spin{font-size:3rem;animation:spin 1s linear infinite}"
+                b"@keyframes spin{to{transform:rotate(360deg)}}</style></head><body>"
+                b"<div class='box'><div class='spin'>&#x21BA;</div>"
+                b"<h2 style='margin-top:16px'>Restarting bot&hellip;</h2>"
+                b"<p style='color:#888'>Page will reload in 6 seconds</p></div>"
+                b"<script>setTimeout(()=>location.href='/',6000)</script>"
+                b"</body></html>"
+            )
+            writer.write(resp)
+            await writer.drain()
+            writer.close()
+            logger.info("Restart requested via health page.")
+            # Give the response time to flush, then restart
+            await asyncio.sleep(0.5)
+            await asyncio.create_subprocess_exec("systemctl", "restart", "dlbot")
+            return
+
+        # ── GET / — normal health page ───────────────────────────────────────
+        _health["bot_ok"]  = True
         _health["pyro_ok"] = pyro.is_connected
         body = _health_html().encode()
         writer.write(
@@ -1127,7 +1610,10 @@ async def _health_handler(reader: asyncio.StreamReader, writer: asyncio.StreamWr
     except Exception:
         pass
     finally:
-        writer.close()
+        try:
+            writer.close()
+        except Exception:
+            pass
 
 # ── Lifecycle ─────────────────────────────────────────────────────────────────
 
@@ -1181,7 +1667,9 @@ def main() -> None:
     app.add_handler(CommandHandler("auth",      cmd_auth))
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("users",     cmd_users))
+    app.add_handler(CommandHandler("vip",       cmd_vip))
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
+    app.add_handler(CallbackQueryHandler(handle_dl_help,  pattern=r"^dlhelp$"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))
 
