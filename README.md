@@ -194,7 +194,7 @@ ufw allow 8888/tcp
 | `/start` | Everyone | Welcome message + quick-action buttons |
 | `/me` | Everyone | Your subscription status and open batch |
 | `/status` | Everyone | Check Google Drive connection |
-| `/auth` | Everyone | Re-authorise Google Drive |
+| `/auth` | Admin only | Re-authorise Google Drive |
 | `/vip` | Admin only | List all VIP users and their credits |
 | `/vip <user_id> <credits>` | Admin only | Grant VIP credits to a user |
 | `/batch` | Everyone | Start collecting files into one archive |

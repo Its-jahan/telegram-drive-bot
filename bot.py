@@ -441,7 +441,7 @@ async def upload_to_drive(path: Path, on_progress=None) -> tuple[str, str]:
     All blocking Drive API calls run in a thread pool."""
     creds = load_creds()
     if not creds:
-        raise RuntimeError("Google Drive not authorised. Run /auth first.")
+        raise RuntimeError("Google Drive is not authorised.")
     loop = asyncio.get_running_loop()
 
     def _do_upload(upload_path: Path) -> tuple[str, str]:
@@ -624,8 +624,18 @@ async def _handle_oauth_callback(reader, writer, app) -> None:
             _auth_server.close()
             _auth_server = None
 
+def drive_offline_text(user_id: int) -> str:
+    return (
+        "⚠️ Google Drive not connected. Run /auth to connect it."
+        if user_id in ADMIN_IDS
+        else "⚠️ Google Drive isn't connected right now — please contact the admin."
+    )
+
 async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     global _pending_flow, _pending_chat_id, _auth_server
+    if not ADMIN_IDS or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
     flow = Flow.from_client_config(_client_config(), scopes=SCOPES, redirect_uri=REDIRECT_URI)
     auth_url, _ = flow.authorization_url(access_type="offline", prompt="consent")
     _pending_flow, _pending_chat_id = flow, update.effective_chat.id
@@ -643,7 +653,8 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_user(update.effective_user)
-    status = "✅ Google Drive connected." if load_creds() else "⚠️ Run /auth first."
+    status = ("✅ Google Drive connected." if load_creds()
+              else drive_offline_text(update.effective_user.id))
     await update.message.reply_text(
         "👋 *Internet → Google Drive Bot*\n\n"
         "I can save files to Google Drive in two ways:\n\n"
@@ -667,7 +678,7 @@ async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
             parse_mode="Markdown",
         )
     else:
-        await update.message.reply_text("❌ Not connected. Run /auth.")
+        await update.message.reply_text(drive_offline_text(update.effective_user.id))
 
 async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
@@ -924,7 +935,7 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await deny_unsubscribed(update)
         return
     if not load_creds():
-        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
+        await update.message.reply_text(drive_offline_text(update.effective_user.id))
         return
 
     _batches[user_id] = []
@@ -1185,7 +1196,7 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text("Please send a valid download URL.")
         return
     if not load_creds():
-        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
+        await update.message.reply_text(drive_offline_text(update.effective_user.id))
         return
 
     url          = match.group(0)
@@ -1231,7 +1242,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await deny_unsubscribed(update)
         return
     if not load_creds():
-        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
+        await update.message.reply_text(drive_offline_text(update.effective_user.id))
         return
 
     msg = update.message
@@ -2382,7 +2393,6 @@ async def on_startup(app: Application) -> None:
             BotCommand("cancel",    "Discard the current batch"),
             BotCommand("subscribe", "Buy a subscription with crypto"),
             BotCommand("status",    "Google Drive connection status"),
-            BotCommand("auth",      "Re-authorise Google Drive"),
         ])
     except Exception as e:
         logger.warning("Could not set command menu: %s", e)
