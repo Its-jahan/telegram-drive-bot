@@ -34,6 +34,8 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | 🌟 | VIP system: bypass size limit & extended timeout |
 | ⭐️ | Paid subscriptions — $2/month or $5/3 months, paid in crypto |
 | 📦 | Batch mode — combine many files/links into a single zip |
+| 🎁 | Free trial for new users, then a paywall |
+| 🤝 | Referral links — inviters earn free days when invitees subscribe |
 | ⌨️ | Quick-action buttons and a Telegram command menu |
 | 🖥️ | Health dashboard with Kill All & Restart buttons |
 | 🔒 | Optional user allowlist |
@@ -182,6 +184,10 @@ ufw allow 8888/tcp
 | `VIP_FILE` | ❌ | `/opt/dlbot/vip.json` | Path to VIP user registry |
 | `SUBS_FILE` | ❌ | `/opt/dlbot/subs.json` | Path to the subscription registry |
 | `PAYMENTS_FILE` | ❌ | `/opt/dlbot/payments.json` | Path to submitted crypto payments |
+| `TRIALS_FILE` | ❌ | `/opt/dlbot/trials.json` | Path to free-trial usage counts |
+| `REFERRALS_FILE` | ❌ | `/opt/dlbot/referrals.json` | Path to referral attribution |
+| `TRIAL_DOWNLOADS` | ❌ | `3` | Free downloads a new user gets |
+| `REFERRAL_BONUS_DAYS` | ❌ | `7` | Days an inviter earns per conversion |
 | `OAUTH_PORT` | ❌ | `8888` | Port for the OAuth callback listener |
 | `ADMIN_IDS` | ❌ | *(empty)* | Comma-separated Telegram user IDs that administer the bot and approve payments |
 
@@ -193,6 +199,7 @@ ufw allow 8888/tcp
 |---|---|---|
 | `/start` | Everyone | Welcome message + quick-action buttons |
 | `/me` | Everyone | Your subscription status and open batch |
+| `/invite` | Everyone | Your referral link and how many converted |
 | `/status` | Everyone | Check Google Drive connection |
 | `/auth` | Admin only | Re-authorise Google Drive |
 | `/vip` | Admin only | List all VIP users and their credits |

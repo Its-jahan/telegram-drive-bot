@@ -5,6 +5,8 @@ gdrive_token.json
 deletions.json
 subs.json
 payments.json
+trials.json
+referrals.json
 users.json
 vip.json
 .env

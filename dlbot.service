@@ -29,6 +29,11 @@ Environment=SCHEDULE_FILE=/opt/dlbot/deletions.json
 Environment=OAUTH_PORT=8888
 Environment=SUBS_FILE=/opt/dlbot/subs.json
 Environment=PAYMENTS_FILE=/opt/dlbot/payments.json
+Environment=TRIALS_FILE=/opt/dlbot/trials.json
+Environment=REFERRALS_FILE=/opt/dlbot/referrals.json
+# Free downloads for a new user, and days the inviter earns per conversion
+Environment=TRIAL_DOWNLOADS=3
+Environment=REFERRAL_BONUS_DAYS=7
 # Comma-separated Telegram user IDs allowed to use the bot (leave empty = public)
 Environment=ADMIN_IDS=
 

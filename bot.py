@@ -60,6 +60,10 @@ USERS_FILE    = Path(os.environ.get("USERS_FILE",      "/opt/dlbot/users.json"))
 VIP_FILE      = Path(os.environ.get("VIP_FILE",        "/opt/dlbot/vip.json"))
 SUBS_FILE     = Path(os.environ.get("SUBS_FILE",       "/opt/dlbot/subs.json"))
 PAYMENTS_FILE = Path(os.environ.get("PAYMENTS_FILE",   "/opt/dlbot/payments.json"))
+TRIALS_FILE   = Path(os.environ.get("TRIALS_FILE",     "/opt/dlbot/trials.json"))
+REFERRALS_FILE = Path(os.environ.get("REFERRALS_FILE", "/opt/dlbot/referrals.json"))
+TRIAL_DOWNLOADS = int(os.environ.get("TRIAL_DOWNLOADS", "3"))
+REFERRAL_BONUS_DAYS = int(os.environ.get("REFERRAL_BONUS_DAYS", "7"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY",      "")
@@ -252,14 +256,84 @@ def status_tag(user_id: int) -> str:
     if sub_active(user_id):
         return f"\n🌟 *Subscribed* — until {fmt_expiry(sub_expiry(user_id))}"
     credits = get_vip_credits(user_id)
-    return f"\n🌟 *VIP* — {credits} credit(s) remaining" if credits > 0 else ""
+    if credits > 0:
+        return f"\n🌟 *VIP* — {credits} credit(s) remaining"
+    left = trial_left(user_id)
+    return f"\n🎁 *Free trial* — {left} download(s) left" if left > 0 else ""
 
 def is_privileged(user_id: int) -> bool:
+    """Perks: no size cap, longer timeout. Trials deliberately don't qualify."""
     return sub_active(user_id) or get_vip_credits(user_id) > 0
 
 def has_access(user_id: int) -> bool:
-    """Downloads are for admins, VIP-credit holders and active subscribers only."""
-    return user_id in ADMIN_IDS or is_privileged(user_id)
+    return user_id in ADMIN_IDS or is_privileged(user_id) or trial_left(user_id) > 0
+
+# ── Free trial ────────────────────────────────────────────────────────────────
+
+def load_trials() -> dict:
+    if TRIALS_FILE.exists():
+        try:
+            return json.loads(TRIALS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_trials(data: dict) -> None:
+    TRIALS_FILE.write_text(json.dumps(data, indent=2))
+
+def trial_left(user_id: int) -> int:
+    return max(0, TRIAL_DOWNLOADS - load_trials().get(str(user_id), 0))
+
+def consume_trial(user_id: int) -> int:
+    data = load_trials()
+    uid  = str(user_id)
+    data[uid] = data.get(uid, 0) + 1
+    save_trials(data)
+    return max(0, TRIAL_DOWNLOADS - data[uid])
+
+# ── Referrals ─────────────────────────────────────────────────────────────────
+
+def load_referrals() -> dict:
+    if REFERRALS_FILE.exists():
+        try:
+            return json.loads(REFERRALS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_referrals(data: dict) -> None:
+    REFERRALS_FILE.write_text(json.dumps(data, indent=2))
+
+def record_referral(invitee_id: int, inviter_id: int) -> bool:
+    """Attribute a new user to whoever invited them. First referrer wins."""
+    if invitee_id == inviter_id:
+        return False
+    data = load_referrals()
+    if str(invitee_id) in data:
+        return False
+    # someone who already used the bot was not brought in by this link
+    if str(invitee_id) in load_users() or trial_left(invitee_id) < TRIAL_DOWNLOADS:
+        return False
+    data[str(invitee_id)] = {"by": inviter_id, "credited": False}
+    save_referrals(data)
+    return True
+
+def referral_stats(user_id: int) -> tuple[int, int]:
+    """(people invited, of those who subscribed)."""
+    data = load_referrals().values()
+    mine = [r for r in data if r["by"] == user_id]
+    return len(mine), sum(1 for r in mine if r["credited"])
+
+def claim_referral_bonus(invitee_id: int) -> int | None:
+    """Credit the inviter once, the first time their invitee pays."""
+    data = load_referrals()
+    rec  = data.get(str(invitee_id))
+    if not rec or rec["credited"]:
+        return None
+    rec["credited"] = True
+    save_referrals(data)
+    grant_sub(rec["by"], REFERRAL_BONUS_DAYS)
+    return rec["by"]
 
 # ── Manual crypto payments ────────────────────────────────────────────────────
 
@@ -652,6 +726,14 @@ async def cmd_auth(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # ── Bot commands ──────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    arg = context.args[0] if getattr(context, "args", None) else ""
+    if arg.startswith("ref_"):
+        try:
+            inviter = int(arg[4:])
+        except ValueError:
+            inviter = 0
+        if inviter and record_referral(update.effective_user.id, inviter):
+            logger.info("Referral: %s invited by %s", update.effective_user.id, inviter)
     register_user(update.effective_user)
     status = ("✅ Google Drive connected." if load_creds()
               else drive_offline_text(update.effective_user.id))
@@ -661,7 +743,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🔗 *Send a download link* — I'll download it on the server\n"
         "📨 *Forward any message* — I'll grab the attached file directly\n"
         "📦 */batch* — collect several files and get them as one zip\n\n"
-        + ("🔒 *A subscription is required* — see /subscribe\n\n"
+        + (f"🎁 *{trial_left(update.effective_user.id)} free download(s)* left — try it now\n\n"
+           if trial_left(update.effective_user.id) > 0
+              and not is_privileged(update.effective_user.id) else
+           "🔒 *Trial used up* — see /subscribe\n\n"
            if not has_access(update.effective_user.id) else
            "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
         + f"{status}{status_tag(update.effective_user.id)}",
@@ -789,10 +874,11 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def deny_unsubscribed(update: Update) -> None:
     plans = "\n".join(f"• {p['label']}" for p in PLANS.values())
     await update.message.reply_text(
-        "🔒 *Subscribers only*\n\n"
-        "This bot needs an active subscription to download files.\n\n"
+        "🎁 *Your free trial is used up*\n\n"
+        f"You've had your {TRIAL_DOWNLOADS} free download(s). "
+        "Subscribe to keep going — you'll also get unlimited size and longer timeouts.\n\n"
         f"{plans}\n\n"
-        "Tap below to subscribe — paid in crypto.",
+        "Paid in crypto.",
         reply_markup=InlineKeyboardMarkup(
             [[InlineKeyboardButton("⭐️ Subscribe", callback_data=f"sub:{k}")]
              for k in PLANS]
@@ -889,6 +975,20 @@ async def handle_pay_review(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         set_payment_status(pid, "approved")
         expiry = grant_sub(rec["user_id"], plan["days"])
         logger.info("Payment %s approved: user=%s plan=%s", pid, rec["user_id"], rec["plan"])
+
+        inviter = claim_referral_bonus(rec["user_id"])
+        if inviter:
+            logger.info("Referral bonus: %s days to %s", REFERRAL_BONUS_DAYS, inviter)
+            try:
+                await context.bot.send_message(
+                    inviter,
+                    f"🎁 *Someone you invited just subscribed!*\n\n"
+                    f"*{REFERRAL_BONUS_DAYS} free days* added — you're now covered until "
+                    f"*{fmt_expiry(sub_expiry(inviter))}*.",
+                    parse_mode="Markdown",
+                )
+            except Exception:
+                pass
         try:
             await context.bot.send_message(
                 rec["user_id"],
@@ -1099,16 +1199,40 @@ async def ensure_pyro() -> None:
         except Exception as e:
             logger.warning("Pyrogram reconnect failed: %s", e)
 
+async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    user_id = update.effective_user.id
+    me      = await context.bot.get_me()
+    link    = f"https://t.me/{me.username}?start=ref_{user_id}"
+    invited, converted = referral_stats(user_id)
+
+    await update.message.reply_text(
+        "🎁 *Invite friends, get free time*\n\n"
+        f"Share your link. When someone you invite subscribes, you get "
+        f"*{REFERRAL_BONUS_DAYS} free days* added to your own subscription.\n\n"
+        f"🔗 `{link}`\n\n"
+        f"👥 Invited: *{invited}*\n"
+        f"✅ Subscribed: *{converted}*  →  *{converted * REFERRAL_BONUS_DAYS}* days earned",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "📤 Share",
+            url=f"https://t.me/share/url?url={link}"
+                f"&text=Save any download link or file straight to Google Drive:",
+        )]]),
+    )
+
 # ── Quick actions ─────────────────────────────────────────────────────────────
 
 BTN_BATCH, BTN_SUB   = "📦 Batch", "⭐️ Subscribe"
 BTN_ME,    BTN_HELP  = "📊 My Status", "❓ Help"
+BTN_INVITE = "🎁 Invite"
 BTN_DONE,  BTN_CANCEL = "✅ Done", "❌ Cancel"
 
 def main_keyboard() -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(
         [[KeyboardButton(BTN_BATCH), KeyboardButton(BTN_SUB)],
-         [KeyboardButton(BTN_ME),    KeyboardButton(BTN_HELP)]],
+         [KeyboardButton(BTN_ME),    KeyboardButton(BTN_INVITE)],
+         [KeyboardButton(BTN_HELP)]],
         resize_keyboard=True,
         input_field_placeholder="Send a link or forward a file…",
     )
@@ -1134,8 +1258,10 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         plan_line = f"🌟 *VIP* — {get_vip_credits(user_id)} credit(s) remaining"
     elif user_id in ADMIN_IDS:
         plan_line = "🛠 *Admin* — unlimited access"
+    elif trial_left(user_id) > 0:
+        plan_line = f"🎁 *Free trial* — {trial_left(user_id)} of {TRIAL_DOWNLOADS} download(s) left"
     else:
-        plan_line = "🔒 *No subscription* — use /subscribe to get access"
+        plan_line = "🔒 *Trial used up* — /subscribe to keep going"
 
     open_batch = _batches.get(user_id)
     batch_line = (
@@ -1144,8 +1270,13 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     drive = "✅ Connected" if load_creds() else "⚠️ Not connected"
 
+    invited, converted = referral_stats(user_id)
+    ref_line = (
+        f"\n🎁 Invited *{invited}* · *{converted}* subscribed — see /invite"
+        if invited else "\n🎁 /invite friends for free days"
+    )
     await update.message.reply_text(
-        f"👤 *Your status*\n\n{plan_line}{batch_line}\n☁️ Google Drive: {drive}",
+        f"👤 *Your status*\n\n{plan_line}{batch_line}{ref_line}\n☁️ Google Drive: {drive}",
         parse_mode="Markdown",
         reply_markup=main_keyboard(),
     )
@@ -1156,6 +1287,7 @@ QUICK_ACTIONS = {
     BTN_SUB:    lambda u, c: cmd_subscribe(u, c),
     BTN_ME:     lambda u, c: cmd_me(u, c),
     BTN_HELP:   lambda u, c: cmd_start(u, c),
+    BTN_INVITE: lambda u, c: cmd_invite(u, c),
     BTN_DONE:   lambda u, c: cmd_batch_done(u, c),
     BTN_CANCEL: lambda u, c: cmd_batch_cancel(u, c),
 }
@@ -1936,17 +2068,24 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
         asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
         _health["total_uploads"] += 1
 
-        # Subscribers download freely; one-off VIP credits are consumed per file
+        # Subscribers download freely; VIP credits and trials are consumed per file
         vip_note = ""
-        if is_vip and user_id:
+        if user_id and user_id not in ADMIN_IDS:
             if sub_active(user_id):
                 vip_note = f"\n🌟 Subscribed until *{fmt_expiry(sub_expiry(user_id))}*"
-            else:
+            elif get_vip_credits(user_id) > 0:
                 remaining = consume_vip_credit(user_id)
                 vip_note = (
                     f"\n🌟 VIP credit used · *{remaining}* credit(s) left"
                     if remaining > 0
                     else "\n🌟 VIP credits used up — normal limits now apply"
+                )
+            else:
+                left = consume_trial(user_id)
+                vip_note = (
+                    f"\n🎁 Free trial — *{left}* download(s) left"
+                    if left > 0
+                    else "\n🎁 That was your last free download — /subscribe to continue"
                 )
 
         drive_view   = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
@@ -2388,6 +2527,7 @@ async def on_startup(app: Application) -> None:
         await app.bot.set_my_commands([
             BotCommand("start",     "Welcome message and what I can do"),
             BotCommand("me",        "Your subscription status"),
+            BotCommand("invite",    "Invite friends and earn free days"),
             BotCommand("batch",     "Collect several files into one zip"),
             BotCommand("done",      "Package the current batch"),
             BotCommand("cancel",    "Discard the current batch"),
@@ -2436,6 +2576,7 @@ def main() -> None:
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("payments",  cmd_payments))
     app.add_handler(CommandHandler("me",        cmd_me))
+    app.add_handler(CommandHandler("invite",    cmd_invite))
     app.add_handler(CommandHandler("batch",     cmd_batch))
     app.add_handler(CommandHandler("done",      cmd_batch_done))
     app.add_handler(CommandHandler("cancel",    cmd_batch_cancel))
