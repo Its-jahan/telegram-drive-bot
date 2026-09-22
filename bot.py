@@ -248,6 +248,10 @@ def status_tag(user_id: int) -> str:
 def is_privileged(user_id: int) -> bool:
     return sub_active(user_id) or get_vip_credits(user_id) > 0
 
+def has_access(user_id: int) -> bool:
+    """Downloads are for admins, VIP-credit holders and active subscribers only."""
+    return user_id in ADMIN_IDS or is_privileged(user_id)
+
 # ── Manual crypto payments ────────────────────────────────────────────────────
 
 WALLETS = {
@@ -618,10 +622,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "I can save files to Google Drive in two ways:\n\n"
         "🔗 *Send a download link* — I'll download it on the server\n"
         "📨 *Forward any message* — I'll grab the attached file directly\n\n"
-        f"📦 Max file size: *{MAX_FILE_MB} MB*\n"
-        f"⏱ Max wait per request: *5 minutes*\n\n"
-        f"⭐️ /subscribe — unlimited downloads, no size cap\n\n"
-        f"{status}{status_tag(update.effective_user.id)}",
+        + ("🔒 *A subscription is required* — see /subscribe\n\n"
+           if not has_access(update.effective_user.id) else
+           "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
+        + f"{status}{status_tag(update.effective_user.id)}",
         parse_mode="Markdown",
     )
 
@@ -739,6 +743,20 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         "• 30-minute timeout instead of 5\n\n"
         "Paid in crypto. Pick a plan:",
         reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+async def deny_unsubscribed(update: Update) -> None:
+    plans = "\n".join(f"• {p['label']}" for p in PLANS.values())
+    await update.message.reply_text(
+        "🔒 *Subscribers only*\n\n"
+        "This bot needs an active subscription to download files.\n\n"
+        f"{plans}\n\n"
+        "Tap below to subscribe — paid in crypto.",
+        reply_markup=InlineKeyboardMarkup(
+            [[InlineKeyboardButton("⭐️ Subscribe", callback_data=f"sub:{k}")]
+             for k in PLANS]
+        ),
         parse_mode="Markdown",
     )
 
@@ -1002,6 +1020,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     register_user(update.effective_user)
     if await handle_txid(update, context):
         return
+    if not has_access(update.effective_user.id):
+        await deny_unsubscribed(update)
+        return
     text  = update.message.text or ""
     match = URL_RE.search(text)
     if not match:
@@ -1036,6 +1057,9 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_user(update.effective_user)
+    if not has_access(update.effective_user.id):
+        await deny_unsubscribed(update)
+        return
     if not load_creds():
         await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
         return
