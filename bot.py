@@ -25,7 +25,14 @@ from googleapiclient.http import MediaFileUpload
 
 from pyrogram import Client as PyroClient
 
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
+    BotCommand,
+)
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -648,6 +655,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
            "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
         + f"{status}{status_tag(update.effective_user.id)}",
         parse_mode="Markdown",
+        reply_markup=main_keyboard(),
     )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -927,20 +935,24 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/done — zip everything into one file\n"
         "/cancel — throw it away",
         parse_mode="Markdown",
+        reply_markup=batch_keyboard(),
     )
 
 async def cmd_batch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     items = _batches.pop(update.effective_user.id, None)
     await update.message.reply_text(
         f"🗑 Batch cancelled ({len(items)} item(s) discarded)." if items
-        else "Nothing to cancel."
+        else "Nothing to cancel.",
+        reply_markup=main_keyboard(),
     )
 
 async def cmd_batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     items   = _batches.get(user_id)
     if items is None:
-        await update.message.reply_text("No batch in progress. Start one with /batch.")
+        await update.message.reply_text(
+            "No batch in progress. Start one with /batch.", reply_markup=main_keyboard()
+        )
         return
     if not items:
         await update.message.reply_text("Batch is empty — send some links or files first.")
@@ -954,6 +966,7 @@ async def cmd_batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         reply_markup=_duration_keyboard("bdur"),
     )
     # hand the items to the prompt; a new /batch shouldn't mutate this one
+    await update.message.reply_text("⬆️ Pick how long to keep it.", reply_markup=main_keyboard())
     _pending_batches[prompt.message_id] = {
         "items":   _batches.pop(user_id),
         "user_id": user_id,
@@ -1075,6 +1088,67 @@ async def ensure_pyro() -> None:
         except Exception as e:
             logger.warning("Pyrogram reconnect failed: %s", e)
 
+# ── Quick actions ─────────────────────────────────────────────────────────────
+
+BTN_BATCH, BTN_SUB   = "📦 Batch", "⭐️ Subscribe"
+BTN_ME,    BTN_HELP  = "📊 My Status", "❓ Help"
+BTN_DONE,  BTN_CANCEL = "✅ Done", "❌ Cancel"
+
+def main_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_BATCH), KeyboardButton(BTN_SUB)],
+         [KeyboardButton(BTN_ME),    KeyboardButton(BTN_HELP)]],
+        resize_keyboard=True,
+        input_field_placeholder="Send a link or forward a file…",
+    )
+
+def batch_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        [[KeyboardButton(BTN_DONE), KeyboardButton(BTN_CANCEL)]],
+        resize_keyboard=True,
+        input_field_placeholder="Send links or files to add…",
+    )
+
+async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    user_id = update.effective_user.id
+
+    if sub_active(user_id):
+        left = int((sub_expiry(user_id) - time.time()) // 86400)
+        plan_line = (
+            f"⭐️ *Subscribed* — until {fmt_expiry(sub_expiry(user_id))} "
+            f"({left} day(s) left)"
+        )
+    elif get_vip_credits(user_id) > 0:
+        plan_line = f"🌟 *VIP* — {get_vip_credits(user_id)} credit(s) remaining"
+    elif user_id in ADMIN_IDS:
+        plan_line = "🛠 *Admin* — unlimited access"
+    else:
+        plan_line = "🔒 *No subscription* — use /subscribe to get access"
+
+    open_batch = _batches.get(user_id)
+    batch_line = (
+        f"\n📦 Batch open — *{len(open_batch)}* item(s) collected"
+        if open_batch is not None else ""
+    )
+    drive = "✅ Connected" if load_creds() else "⚠️ Not connected"
+
+    await update.message.reply_text(
+        f"👤 *Your status*\n\n{plan_line}{batch_line}\n☁️ Google Drive: {drive}",
+        parse_mode="Markdown",
+        reply_markup=main_keyboard(),
+    )
+
+# label -> the command it stands in for
+QUICK_ACTIONS = {
+    BTN_BATCH:  lambda u, c: cmd_batch(u, c),
+    BTN_SUB:    lambda u, c: cmd_subscribe(u, c),
+    BTN_ME:     lambda u, c: cmd_me(u, c),
+    BTN_HELP:   lambda u, c: cmd_start(u, c),
+    BTN_DONE:   lambda u, c: cmd_batch_done(u, c),
+    BTN_CANCEL: lambda u, c: cmd_batch_cancel(u, c),
+}
+
 # ── URL handler ───────────────────────────────────────────────────────────────
 
 def _safe_display_url(url: str) -> str:
@@ -1096,6 +1170,12 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     register_user(update.effective_user)
     if await handle_txid(update, context):
         return
+
+    action = QUICK_ACTIONS.get((update.message.text or "").strip())
+    if action:
+        await action(update, context)
+        return
+
     if not has_access(update.effective_user.id):
         await deny_unsubscribed(update)
         return
@@ -2293,6 +2373,19 @@ async def on_startup(app: Application) -> None:
     logger.info("Local janitor started (cleans files older than %d min).", LOCAL_MAX_AGE // 60)
     _health_server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
     logger.info("Health check running on http://0.0.0.0:%d", HEALTH_PORT)
+    try:
+        await app.bot.set_my_commands([
+            BotCommand("start",     "Welcome message and what I can do"),
+            BotCommand("me",        "Your subscription status"),
+            BotCommand("batch",     "Collect several files into one zip"),
+            BotCommand("done",      "Package the current batch"),
+            BotCommand("cancel",    "Discard the current batch"),
+            BotCommand("subscribe", "Buy a subscription with crypto"),
+            BotCommand("status",    "Google Drive connection status"),
+            BotCommand("auth",      "Re-authorise Google Drive"),
+        ])
+    except Exception as e:
+        logger.warning("Could not set command menu: %s", e)
 
 async def on_shutdown(app: Application) -> None:
     global _health_server
@@ -2332,6 +2425,7 @@ def main() -> None:
     app.add_handler(CommandHandler("vip",       cmd_vip))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("payments",  cmd_payments))
+    app.add_handler(CommandHandler("me",        cmd_me))
     app.add_handler(CommandHandler("batch",     cmd_batch))
     app.add_handler(CommandHandler("done",      cmd_batch_done))
     app.add_handler(CommandHandler("cancel",    cmd_batch_cancel))

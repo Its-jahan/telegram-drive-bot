@@ -34,6 +34,7 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | 🌟 | VIP system: bypass size limit & extended timeout |
 | ⭐️ | Paid subscriptions — $2/month or $5/3 months, paid in crypto |
 | 📦 | Batch mode — combine many files/links into a single zip |
+| ⌨️ | Quick-action buttons and a Telegram command menu |
 | 🖥️ | Health dashboard with Kill All & Restart buttons |
 | 🔒 | Optional user allowlist |
 
@@ -190,7 +191,8 @@ ufw allow 8888/tcp
 
 | Command | Who | Description |
 |---|---|---|
-| `/start` | Everyone | Welcome message + connection status |
+| `/start` | Everyone | Welcome message + quick-action buttons |
+| `/me` | Everyone | Your subscription status and open batch |
 | `/status` | Everyone | Check Google Drive connection |
 | `/auth` | Everyone | Re-authorise Google Drive |
 | `/vip` | Admin only | List all VIP users and their credits |
