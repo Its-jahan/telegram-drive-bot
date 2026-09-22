@@ -24,7 +24,7 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | ⚡ | Fast parallel download via aria2 (URLs) |
 | 📡 | Large file support up to **2 GB** via Pyrogram MTProto |
 | ☁️ | Direct upload to Google Drive |
-| ⏱ | Auto-delete after 1 h / 5 h / 12 h / 1 day |
+| ⏱ | Auto-delete after 1 h / 5 h / 12 h / 1 / 2 / 4 days |
 | 🔄 | Deletions survive server restarts |
 | 📊 | Live download/upload progress with ETA |
 | 🔢 | Queue position display while waiting |

@@ -95,10 +95,12 @@ _health: dict = {
 }
 
 DURATIONS = {
-    "1h":  ("1 hour",   3600),
-    "5h":  ("5 hours",  18000),
-    "12h": ("12 hours", 43200),
-    "1d":  ("1 day",    86400),
+    "1h":  ("1 hour",   3600,   "⏱"),
+    "5h":  ("5 hours",  18000,  "⏱"),
+    "12h": ("12 hours", 43200,  "⏱"),
+    "1d":  ("1 day",    86400,  "📅"),
+    "2d":  ("2 days",   172800, "📅"),
+    "4d":  ("4 days",   345600, "📅"),
 }
 
 # message_id → pending data
@@ -949,12 +951,7 @@ async def cmd_batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         f"📦 *{len(items)} item(s) ready*\n\n{listing}\n\n"
         "How long should the archive be kept on Google Drive?",
         parse_mode="Markdown",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("⏱ 1 hour",   callback_data="bdur:1h"),
-             InlineKeyboardButton("⏱ 5 hours",  callback_data="bdur:5h")],
-            [InlineKeyboardButton("⏱ 12 hours", callback_data="bdur:12h"),
-             InlineKeyboardButton("📅 1 day",    callback_data="bdur:1d")],
-        ]),
+        reply_markup=_duration_keyboard("bdur"),
     )
     # hand the items to the prompt; a new /batch shouldn't mutate this one
     _pending_batches[prompt.message_id] = {
@@ -1063,17 +1060,12 @@ async def run_aria2(url: str, dest_dir: Path, on_progress=None) -> tuple[int, st
     await proc.wait()
     return proc.returncode, stdout_bytes.decode(), "\n".join(stderr_lines)
 
-def _duration_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⏱ 1 hour",   callback_data="dur:1h"),
-            InlineKeyboardButton("⏱ 5 hours",  callback_data="dur:5h"),
-        ],
-        [
-            InlineKeyboardButton("⏱ 12 hours", callback_data="dur:12h"),
-            InlineKeyboardButton("📅 1 day",    callback_data="dur:1d"),
-        ],
-    ])
+def _duration_keyboard(prefix: str = "dur") -> InlineKeyboardMarkup:
+    buttons = [
+        InlineKeyboardButton(f"{icon} {label}", callback_data=f"{prefix}:{key}")
+        for key, (label, _sec, icon) in DURATIONS.items()
+    ]
+    return InlineKeyboardMarkup([buttons[i:i + 2] for i in range(0, len(buttons), 2)])
 
 async def ensure_pyro() -> None:
     if not pyro.is_connected:
@@ -1251,7 +1243,7 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     key    = query.data.split(":")[1]
-    label, seconds = DURATIONS[key]
+    label, seconds, _ = DURATIONS[key]
     msg_id = query.message.message_id
 
     url_info  = _pending_urls.pop(msg_id, None)
@@ -1310,7 +1302,7 @@ async def handle_batch_duration(update: Update, context: ContextTypes.DEFAULT_TY
     query = update.callback_query
     await query.answer()
 
-    label, seconds = DURATIONS[query.data.split(":")[1]]
+    label, seconds, _ = DURATIONS[query.data.split(":")[1]]
     msg_id  = query.message.message_id
     batch   = _pending_batches.pop(msg_id, None)
     if not batch:
