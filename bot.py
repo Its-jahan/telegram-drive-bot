@@ -738,6 +738,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             inviter = 0
         if inviter and record_referral(update.effective_user.id, inviter):
             logger.info("Referral: %s invited by %s", update.effective_user.id, inviter)
+    if arg == "subscribe":
+        register_user(update.effective_user)
+        await cmd_subscribe(update, context)
+        return
     register_user(update.effective_user)
     status = ("✅ Google Drive connected." if load_creds()
               else drive_offline_text(update.effective_user.id))
@@ -755,7 +759,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
            "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
         + f"{status}{status_tag(update.effective_user.id)}",
         parse_mode="Markdown",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(update),
     )
 
 async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1050,7 +1054,7 @@ async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "/done — zip everything into one file\n"
         "/cancel — throw it away",
         parse_mode="Markdown",
-        reply_markup=batch_keyboard(),
+        reply_markup=batch_keyboard() if not is_group(update) else None,
     )
 
 async def cmd_batch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1058,7 +1062,7 @@ async def cmd_batch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     await update.message.reply_text(
         f"🗑 Batch cancelled ({len(items)} item(s) discarded)." if items
         else "Nothing to cancel.",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(update),
     )
 
 async def cmd_batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -1285,6 +1289,23 @@ async def cmd_invite(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         )]]),
     )
 
+def is_group(update: Update) -> bool:
+    return update.effective_chat.type in ("group", "supergroup")
+
+def _mention(user) -> str:
+    return f"[{user.full_name}](tg://user?id={user.id})"
+
+async def deny_in_group(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Groups can't take payment, so point the sender at a private chat."""
+    await update.message.reply_text(
+        f"🔒 {_mention(update.effective_user)} — you need a subscription "
+        "(or a free trial download) to use me here.",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton(
+            "⭐️ Open in private", url=f"https://t.me/{context.bot.username}?start=subscribe"
+        )]]),
+    )
+
 # ── Quick actions ─────────────────────────────────────────────────────────────
 
 BTN_BATCH, BTN_SUB   = "📦 Batch", "⭐️ Subscribe"
@@ -1292,7 +1313,10 @@ BTN_ME,    BTN_HELP  = "📊 My Status", "❓ Help"
 BTN_INVITE = "🎁 Invite"
 BTN_DONE,  BTN_CANCEL = "✅ Done", "❌ Cancel"
 
-def main_keyboard() -> ReplyKeyboardMarkup:
+def main_keyboard(update: Update | None = None) -> ReplyKeyboardMarkup | None:
+    # a reply keyboard in a group would show for every member
+    if update is not None and is_group(update):
+        return None
     return ReplyKeyboardMarkup(
         [[KeyboardButton(BTN_BATCH), KeyboardButton(BTN_SUB)],
          [KeyboardButton(BTN_ME),    KeyboardButton(BTN_INVITE)],
@@ -1342,7 +1366,7 @@ async def cmd_me(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         f"👤 *Your status*\n\n{plan_line}{batch_line}{ref_line}\n☁️ Google Drive: {drive}",
         parse_mode="Markdown",
-        reply_markup=main_keyboard(),
+        reply_markup=main_keyboard(update),
     )
 
 # label -> the command it stands in for
@@ -1375,31 +1399,57 @@ def _safe_display_url(url: str) -> str:
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_user(update.effective_user)
-    if await handle_txid(update, context):
-        return
-
-    action = QUICK_ACTIONS.get((update.message.text or "").strip())
-    if action:
-        await action(update, context)
-        return
-
-    if not has_access(update.effective_user.id):
-        await deny_unsubscribed(update)
-        return
+    group = is_group(update)
     text  = update.message.text or ""
     match = URL_RE.search(text)
+
+    # In a group the bot is a guest: it only speaks up for a video link, and
+    # stays silent on everything else rather than replying to normal chatter.
+    if group:
+        if not match or not is_video_site(match.group(0)):
+            return
+    else:
+        if await handle_txid(update, context):
+            return
+        action = QUICK_ACTIONS.get(text.strip())
+        if action:
+            await action(update, context)
+            return
+
+    if not has_access(update.effective_user.id):
+        await (deny_in_group(update, context) if group else deny_unsubscribed(update))
+        return
+
     if not match:
         await update.message.reply_text("Please send a valid download URL.")
         return
-    if not load_creds():
-        await update.message.reply_text(drive_offline_text(update.effective_user.id))
-        return
 
-    url          = match.group(0)
-    display_url  = _safe_display_url(url)
+    url         = match.group(0)
+    display_url = _safe_display_url(url)
 
     if _is_blocked(url):
         await update.message.reply_text(_BLOCKED_REPLY)
+        return
+
+    # a group only ever gets the Telegram copy — Drive is the owner's account
+    if group:
+        prompt = await update.message.reply_text(
+            f"🎬 *Video link from* {_mention(update.effective_user)}\n"
+            f"`{display_url[:70]}`\n\nSend it to this chat?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📤 Send here", callback_data="vdest:tg"),
+                InlineKeyboardButton("✖️ No", callback_data="vdest:no"),
+            ]]),
+        )
+        _pending_videos[prompt.message_id] = {
+            "url": url, "user_id": update.effective_user.id,
+            "is_vip": is_privileged(update.effective_user.id),
+        }
+        return
+
+    if not load_creds():
+        await update.message.reply_text(drive_offline_text(update.effective_user.id))
         return
 
     name  = url.split("/")[-1].split("?")[0] or url[:40]
@@ -1449,6 +1499,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 # ── File/forward handler ──────────────────────────────────────────────────────
 
 async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if is_group(update):
+        return
     register_user(update.effective_user)
     if not has_access(update.effective_user.id):
         await deny_unsubscribed(update)
@@ -1829,14 +1881,32 @@ async def _do_batch(task_id, bot, chat_id, msg_id, items, label, seconds,
         shutil.rmtree(batch_dir, ignore_errors=True)
 
 async def handle_video_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    query = update.callback_query
-    await query.answer()
+    query  = update.callback_query
     dest   = query.data.split(":", 1)[1]
     msg_id = query.message.message_id
     info   = _pending_videos.get(msg_id)
     if not info:
+        await query.answer()
         await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
+
+    # in a group anyone can see the buttons, so only the sender may act on them
+    if query.from_user.id != info["user_id"]:
+        await query.answer("This isn't your link.", show_alert=True)
+        return
+
+    if dest == "no":
+        _pending_videos.pop(msg_id, None)
+        await query.answer()
+        await query.edit_message_text("✖️ Cancelled.")
+        return
+
+    # the trial may have run out between sending the link and tapping
+    if not has_access(info["user_id"]):
+        await query.answer("Your free trial is used up — subscribe to continue.", show_alert=True)
+        return
+
+    await query.answer()
     info["dest"] = dest
 
     # only a Drive copy needs an expiry
@@ -1855,10 +1925,14 @@ async def handle_video_duration(update: Update, context: ContextTypes.DEFAULT_TY
     await query.answer()
     label, seconds, _ = DURATIONS[query.data.split(":")[1]]
     msg_id = query.message.message_id
-    info   = _pending_videos.pop(msg_id, None)
+    info   = _pending_videos.get(msg_id)
     if not info:
         await query.edit_message_text("⚠️ Session expired. Send the link again.")
         return
+    if query.from_user.id != info["user_id"]:
+        await query.answer("This isn't your link.", show_alert=True)
+        return
+    _pending_videos.pop(msg_id, None)
     await _launch_video(context, update.effective_chat.id, msg_id, info, label, seconds)
 
 async def _launch_video(context, chat_id, msg_id, info, label, seconds) -> None:

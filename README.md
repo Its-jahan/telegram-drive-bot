@@ -36,6 +36,7 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | 📦 | Batch mode — combine many files/links into a single zip |
 | 🎬 | Video downloads via yt-dlp — YouTube, TikTok, Instagram, Facebook, Bilibili, Youku and 1800+ sites |
 | 📲 | Choose delivery: straight to Telegram, to Google Drive, or both |
+| 👥 | Works in groups — offers to fetch video links, charged to the sender |
 | 🎁 | Free trial for new users, then a paywall |
 | 🤝 | Referral links — inviters earn free days when invitees subscribe |
 | ⌨️ | Quick-action buttons and a Telegram command menu |
