@@ -3,6 +3,10 @@ gdrive_token.json
 *.session
 *.session-journal
 deletions.json
+subs.json
+invoices.json
+users.json
+vip.json
 .env
 
 # Python

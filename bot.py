@@ -17,6 +17,8 @@ import shutil
 import time
 from pathlib import Path
 
+import httpx
+
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
@@ -51,6 +53,10 @@ TOKEN_FILE    = Path(os.environ.get("TOKEN_FILE",      "/opt/dlbot/gdrive_token.
 SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE",  "/opt/dlbot/deletions.json"))
 USERS_FILE    = Path(os.environ.get("USERS_FILE",      "/opt/dlbot/users.json"))
 VIP_FILE      = Path(os.environ.get("VIP_FILE",        "/opt/dlbot/vip.json"))
+SUBS_FILE     = Path(os.environ.get("SUBS_FILE",       "/opt/dlbot/subs.json"))
+INVOICES_FILE = Path(os.environ.get("INVOICES_FILE",   "/opt/dlbot/invoices.json"))
+CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN",    "")
+CRYPTOBOT_API   = os.environ.get("CRYPTOBOT_API",      "https://pay.crypt.bot/api")
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY",      "")
@@ -199,6 +205,136 @@ def consume_vip_credit(user_id: int) -> int:
         del data[uid]
     save_vip(data)
     return data.get(uid, 0)
+
+# ── Subscriptions ─────────────────────────────────────────────────────────────
+
+PLANS = {
+    "1m": {"days": 30, "usd": "2",  "label": "1 month — $2"},
+    "3m": {"days": 90, "usd": "5",  "label": "3 months — $5"},
+}
+
+def load_subs() -> dict:
+    if SUBS_FILE.exists():
+        try:
+            return json.loads(SUBS_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_subs(data: dict) -> None:
+    SUBS_FILE.write_text(json.dumps(data, indent=2))
+
+def sub_expiry(user_id: int) -> float:
+    return float(load_subs().get(str(user_id), 0))
+
+def sub_active(user_id: int) -> bool:
+    return sub_expiry(user_id) > time.time()
+
+def grant_sub(user_id: int, days: int) -> float:
+    """Add days to a subscription, extending an active one rather than truncating it."""
+    data  = load_subs()
+    uid   = str(user_id)
+    base  = max(float(data.get(uid, 0)), time.time())
+    data[uid] = base + days * 86400
+    save_subs(data)
+    return data[uid]
+
+def fmt_expiry(ts: float) -> str:
+    return time.strftime("%Y-%m-%d", time.gmtime(ts))
+
+def status_tag(user_id: int) -> str:
+    """Status line appended to user-facing messages."""
+    if sub_active(user_id):
+        return f"\n🌟 *Subscribed* — until {fmt_expiry(sub_expiry(user_id))}"
+    credits = get_vip_credits(user_id)
+    return f"\n🌟 *VIP* — {credits} credit(s) remaining" if credits > 0 else ""
+
+def is_privileged(user_id: int) -> bool:
+    return sub_active(user_id) or get_vip_credits(user_id) > 0
+
+# ── Crypto Pay (@CryptoBot) ───────────────────────────────────────────────────
+
+def load_invoices() -> dict:
+    if INVOICES_FILE.exists():
+        try:
+            return json.loads(INVOICES_FILE.read_text())
+        except Exception:
+            pass
+    return {}
+
+def save_invoices(data: dict) -> None:
+    INVOICES_FILE.write_text(json.dumps(data, indent=2))
+
+async def _cp_call(method: str, payload: dict | None = None) -> dict:
+    if not CRYPTOBOT_TOKEN:
+        raise RuntimeError("CRYPTOBOT_TOKEN is not set")
+    async with httpx.AsyncClient(timeout=20) as client:
+        r = await client.post(
+            f"{CRYPTOBOT_API}/{method}",
+            headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
+            json=payload or {},
+        )
+        r.raise_for_status()
+        body = r.json()
+    if not body.get("ok"):
+        raise RuntimeError(f"Crypto Pay error: {body.get('error')}")
+    return body["result"]
+
+async def cp_create_invoice(user_id: int, plan_key: str) -> dict:
+    plan = PLANS[plan_key]
+    return await _cp_call("createInvoice", {
+        "currency_type": "fiat",
+        "fiat":          "USD",
+        "amount":        plan["usd"],
+        "description":   f"Drive bot — {plan['label']}",
+        "payload":       f"{user_id}:{plan_key}",
+        "expires_in":    3600,
+        "allow_comments": False,
+    })
+
+async def cp_paid_invoice_ids(ids: list[str]) -> set[str]:
+    if not ids:
+        return set()
+    result = await _cp_call("getInvoices", {"invoice_ids": ",".join(ids), "status": "paid"})
+    return {str(item["invoice_id"]) for item in result.get("items", [])}
+
+async def _activate_invoice(app: Application, invoice_id: str, rec: dict) -> None:
+    user_id  = int(rec["user_id"])
+    plan_key = rec["plan"]
+    plan     = PLANS[plan_key]
+    expiry   = grant_sub(user_id, plan["days"])
+    logger.info("Subscription activated: user=%s plan=%s invoice=%s", user_id, plan_key, invoice_id)
+    try:
+        await app.bot.send_message(
+            user_id,
+            f"✅ *Payment received!*\n\n"
+            f"Your *{plan['label']}* subscription is active until *{fmt_expiry(expiry)}*.\n\n"
+            f"You now get unlimited downloads, no {MAX_FILE_MB} MB cap, and a 30-minute timeout.",
+            parse_mode="Markdown",
+        )
+    except Exception:
+        pass
+
+async def _invoice_poller(app: Application) -> None:
+    """Every 30s, activate any pending invoice that Crypto Pay reports as paid."""
+    while True:
+        await asyncio.sleep(30)
+        try:
+            pending = load_invoices()
+            if not pending:
+                continue
+            now     = time.time()
+            stale   = [i for i, r in pending.items() if now - r.get("created", now) > 7200]
+            paid    = await cp_paid_invoice_ids(list(pending))
+            for invoice_id in paid:
+                rec = pending.get(invoice_id)
+                if rec:
+                    await _activate_invoice(app, invoice_id, rec)
+            for invoice_id in paid | set(stale):
+                pending.pop(invoice_id, None)
+            save_invoices(pending)
+        except Exception as e:
+            logger.warning("Invoice poller: %s", e)
 
 # ── ETA helper ────────────────────────────────────────────────────────────────
 
@@ -473,7 +609,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "📨 *Forward any message* — I'll grab the attached file directly\n\n"
         f"📦 Max file size: *{MAX_FILE_MB} MB*\n"
         f"⏱ Max wait per request: *5 minutes*\n\n"
-        f"{status}",
+        f"⭐️ /subscribe — unlimited downloads, no size cap\n\n"
+        f"{status}{status_tag(update.effective_user.id)}",
         parse_mode="Markdown",
     )
 
@@ -569,6 +706,98 @@ async def cmd_vip(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
             f"📦 No size limit · ⏱ 30-min timeout per file",
             parse_mode="Markdown",
         )
+
+async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    user_id = update.effective_user.id
+
+    if not CRYPTOBOT_TOKEN:
+        await update.message.reply_text("💤 Subscriptions aren't set up on this bot yet.")
+        return
+
+    current = ""
+    if sub_active(user_id):
+        current = (
+            f"🌟 You're subscribed until *{fmt_expiry(sub_expiry(user_id))}*.\n"
+            "Buying again extends it from that date.\n\n"
+        )
+
+    keyboard = [[InlineKeyboardButton(p["label"], callback_data=f"sub:{k}")]
+                for k, p in PLANS.items()]
+    await update.message.reply_text(
+        f"{current}"
+        "⭐️ *Subscription*\n\n"
+        f"• Unlimited downloads\n"
+        f"• No {MAX_FILE_MB} MB size limit\n"
+        f"• 30-minute timeout instead of 5\n\n"
+        "Paid in crypto (USDT, TON, BTC and more) via @CryptoBot.\n"
+        "Pick a plan:",
+        reply_markup=InlineKeyboardMarkup(keyboard),
+        parse_mode="Markdown",
+    )
+
+async def handle_sub_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    plan_key = query.data.split(":", 1)[1]
+    if plan_key not in PLANS:
+        return
+    user_id = query.from_user.id
+
+    try:
+        invoice = await cp_create_invoice(user_id, plan_key)
+    except Exception as e:
+        logger.warning("Invoice creation failed for %s: %s", user_id, e)
+        await query.message.reply_text("❌ Couldn't create the invoice. Try again in a moment.")
+        return
+
+    invoice_id = str(invoice["invoice_id"])
+    pay_url    = invoice.get("bot_invoice_url") or invoice.get("pay_url")
+
+    pending = load_invoices()
+    pending[invoice_id] = {"user_id": user_id, "plan": plan_key, "created": time.time()}
+    save_invoices(pending)
+
+    await query.message.reply_text(
+        f"🧾 *{PLANS[plan_key]['label']}*\n\n"
+        "Tap *Pay* to complete the payment in @CryptoBot.\n"
+        "I'll confirm here automatically within a minute of payment.\n\n"
+        "_The invoice expires in 1 hour._",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("💳 Pay", url=pay_url)],
+            [InlineKeyboardButton("🔄 I've paid — check now", callback_data=f"subchk:{invoice_id}")],
+        ]),
+        parse_mode="Markdown",
+    )
+
+async def handle_sub_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    invoice_id = query.data.split(":", 1)[1]
+
+    pending = load_invoices()
+    rec     = pending.get(invoice_id)
+    if not rec:
+        await query.answer(
+            "Already confirmed." if sub_active(query.from_user.id) else "Invoice expired.",
+            show_alert=True,
+        )
+        return
+
+    try:
+        paid = await cp_paid_invoice_ids([invoice_id])
+    except Exception as e:
+        logger.warning("Invoice check failed: %s", e)
+        await query.answer("Couldn't reach the payment service. Try again shortly.", show_alert=True)
+        return
+
+    if invoice_id not in paid:
+        await query.answer("No payment yet. If you just paid, give it a few seconds.", show_alert=True)
+        return
+
+    await query.answer()
+    await _activate_invoice(context.application, invoice_id, rec)
+    pending.pop(invoice_id, None)
+    save_invoices(pending)
 
 async def handle_dl_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -716,9 +945,8 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(_BLOCKED_REPLY)
         return
 
-    vip_credits  = get_vip_credits(update.effective_user.id)
-    is_vip       = vip_credits > 0
-    vip_tag      = f"\n🌟 *VIP* — {vip_credits} credit(s) remaining" if is_vip else ""
+    is_vip       = is_privileged(update.effective_user.id)
+    vip_tag      = status_tag(update.effective_user.id)
 
     msg = await update.message.reply_text(
         f"🔗 Link received!\n`{display_url[:80]}`{vip_tag}\n\nHow long should this file be stored on Google Drive?",
@@ -762,8 +990,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     size_mb    = (tg_obj.file_size or 0) / (1024 * 1024)
-    vip_credits = get_vip_credits(update.effective_user.id)
-    is_vip      = vip_credits > 0
+    is_vip      = is_privileged(update.effective_user.id)
 
     if _is_blocked(fname):
         await msg.reply_text(_BLOCKED_REPLY)
@@ -780,7 +1007,7 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     is_forwarded = msg.forward_origin is not None or msg.forward_date is not None
     source_tag   = "📨 Forwarded file" if is_forwarded else "📎 File received"
     method_tag   = "📡 MTProto (Pyrogram)" if size_mb > TG_BOT_API_LIMIT_MB else "⚡ Bot API"
-    vip_tag      = f"\n🌟 *VIP* — {vip_credits} credit(s) remaining" if is_vip else ""
+    vip_tag      = status_tag(update.effective_user.id)
 
     prompt = await msg.reply_text(
         f"{source_tag}: `{fname}`\n"
@@ -1186,15 +1413,18 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
         asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
         _health["total_uploads"] += 1
 
-        # VIP: consume one credit and tell the user how many remain
+        # Subscribers download freely; one-off VIP credits are consumed per file
         vip_note = ""
         if is_vip and user_id:
-            remaining = consume_vip_credit(user_id)
-            vip_note = (
-                f"\n🌟 VIP credit used · *{remaining}* credit(s) left"
-                if remaining > 0
-                else "\n🌟 VIP credits used up — normal limits now apply"
-            )
+            if sub_active(user_id):
+                vip_note = f"\n🌟 Subscribed until *{fmt_expiry(sub_expiry(user_id))}*"
+            else:
+                remaining = consume_vip_credit(user_id)
+                vip_note = (
+                    f"\n🌟 VIP credit used · *{remaining}* credit(s) left"
+                    if remaining > 0
+                    else "\n🌟 VIP credits used up — normal limits now apply"
+                )
 
         drive_view   = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
         api_link     = (
@@ -1631,6 +1861,11 @@ async def on_startup(app: Application) -> None:
     logger.info("Local janitor started (cleans files older than %d min).", LOCAL_MAX_AGE // 60)
     _health_server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
     logger.info("Health check running on http://0.0.0.0:%d", HEALTH_PORT)
+    if CRYPTOBOT_TOKEN:
+        asyncio.create_task(_invoice_poller(app))
+        logger.info("Crypto Pay invoice poller started.")
+    else:
+        logger.warning("CRYPTOBOT_TOKEN not set — /subscribe is disabled.")
 
 async def on_shutdown(app: Application) -> None:
     global _health_server
@@ -1668,6 +1903,9 @@ def main() -> None:
     app.add_handler(CommandHandler("broadcast", cmd_broadcast))
     app.add_handler(CommandHandler("users",     cmd_users))
     app.add_handler(CommandHandler("vip",       cmd_vip))
+    app.add_handler(CommandHandler("subscribe", cmd_subscribe))
+    app.add_handler(CallbackQueryHandler(handle_sub_plan,  pattern=r"^sub:"))
+    app.add_handler(CallbackQueryHandler(handle_sub_check, pattern=r"^subchk:"))
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
     app.add_handler(CallbackQueryHandler(handle_dl_help,  pattern=r"^dlhelp$"))
     app.add_handler(MessageHandler(media_filter, handle_file))
