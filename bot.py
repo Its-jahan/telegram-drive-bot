@@ -71,7 +71,7 @@ _BLOCKED_KEYWORDS = re.compile(
     re.IGNORECASE,
 )
 _BLOCKED_REPLY = (
-    "⛔️ با توجه به محدودیت‌های گوگل و ریسک بن شدن، نمی‌تونیم این فایل رو قبول کنیم."
+    "⛔️ We can't accept this file — Google's restrictions make it a ban risk."
 )
 
 def _is_blocked(text: str) -> bool:
@@ -892,10 +892,9 @@ async def handle_dl_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     query = update.callback_query
     await query.answer()
     await query.message.reply_text(
-        "برای اینکه بتونید فایل رو از متود دوم \\(دانلود مستقیم\\) دانلود کنید\n"
-        "باید از سرویس پولی شکن استفاده کنید تا بتونید دانلود کنید\n"
-        "[shecan\\.ir](http://shecan.ir)\n\n"
-        "درصورتی که سوالی داشتید به من پیام بدین\n"
+        "To use the second option \\(direct download\\), you need an active\n"
+        "DNS service such as [shecan\\.ir](http://shecan.ir)\\.\n\n"
+        "Message me if you have any questions\n"
         "@ImJahan",
         parse_mode="MarkdownV2",
         disable_web_page_preview=False,
@@ -1530,17 +1529,17 @@ async def _do_download_upload(task_id, bot, chat_id, msg_id, url, file_info, lab
             if GOOGLE_API_KEY else drive_view
         )
         help_keyboard = InlineKeyboardMarkup([[
-            InlineKeyboardButton("در دانلود مشکل دارید؟ 🔧", callback_data="dlhelp")
+            InlineKeyboardButton("🔧 Trouble downloading?", callback_data="dlhelp")
         ]])
         await _edit(
             f"✅ *Done!*{vip_badge}\n\n"
             f"📁 `{fname}`\n"
             f"📦 {size_mb_final:.1f} MB\n"
             f"🗑 Auto-delete in: *{label}*{vip_note}\n\n"
-            f"1️⃣ [گوگل درایو]({drive_view})\n"
-            f"2️⃣ [دانلود مستقیم]({api_link})\n\n"
-            f"دقت کنید متود دوم (دانلود مستقیم) تست شده و برای تمامی اینترنت‌هایی که شکن فعال دارن کار می‌کنه\n"
-            f"درصورتی که شکن رو فعال کردین و کار نکرد لطفاً حتماً بهم اطلاع بدین تا اگر غیرفعال شده باشه تست کنم و متود رو غیرفعال کنیم",
+            f"1️⃣ [Google Drive]({drive_view})\n"
+            f"2️⃣ [Direct download]({api_link})\n\n"
+            f"Option 2 is tested and works on any connection with an active DNS service.\n"
+            f"If you have one enabled and it still fails, please tell me so I can check it.",
             reply_markup=help_keyboard,
         )
 
