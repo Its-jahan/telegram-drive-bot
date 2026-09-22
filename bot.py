@@ -17,8 +17,6 @@ import shutil
 import time
 from pathlib import Path
 
-import httpx
-
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
 from google_auth_oauthlib.flow import Flow
@@ -54,9 +52,7 @@ SCHEDULE_FILE = Path(os.environ.get("SCHEDULE_FILE",  "/opt/dlbot/deletions.json
 USERS_FILE    = Path(os.environ.get("USERS_FILE",      "/opt/dlbot/users.json"))
 VIP_FILE      = Path(os.environ.get("VIP_FILE",        "/opt/dlbot/vip.json"))
 SUBS_FILE     = Path(os.environ.get("SUBS_FILE",       "/opt/dlbot/subs.json"))
-INVOICES_FILE = Path(os.environ.get("INVOICES_FILE",   "/opt/dlbot/invoices.json"))
-CRYPTOBOT_TOKEN = os.environ.get("CRYPTOBOT_TOKEN",    "")
-CRYPTOBOT_API   = os.environ.get("CRYPTOBOT_API",      "https://pay.crypt.bot/api")
+PAYMENTS_FILE = Path(os.environ.get("PAYMENTS_FILE",   "/opt/dlbot/payments.json"))
 ADMIN_IDS     = [int(x) for x in os.environ.get("ADMIN_IDS", "").split(",") if x.strip()]
 SERVER_IP     = os.environ.get("SERVER_IP",            "31.59.105.156")
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY",      "")
@@ -252,89 +248,104 @@ def status_tag(user_id: int) -> str:
 def is_privileged(user_id: int) -> bool:
     return sub_active(user_id) or get_vip_credits(user_id) > 0
 
-# ── Crypto Pay (@CryptoBot) ───────────────────────────────────────────────────
+# ── Manual crypto payments ────────────────────────────────────────────────────
 
-def load_invoices() -> dict:
-    if INVOICES_FILE.exists():
+WALLETS = {
+    "usdt": {
+        "label":   "USDT (BEP20)",
+        "network": "BNB Smart Chain · BEP20",
+        "address": "0x64609F5957Af9e0bc7c0809527BfdE6CeB1996c2",
+    },
+    "usdc": {
+        "label":   "USDC (BEP20)",
+        "network": "BNB Smart Chain · BEP20",
+        "address": "0x64609F5957Af9e0bc7c0809527BfdE6CeB1996c2",
+    },
+    "ton": {
+        "label":   "TON",
+        "network": "The Open Network",
+        "address": "UQB3OdG4DyQy3BokQ5Js3361JVL7eSRzciq-zS2LGaHGuQPP",
+    },
+    "btc": {
+        "label":   "BTC",
+        "network": "Bitcoin",
+        "address": "bc1qknujv9csu0a3gpzpvc6t4pk98vdzkes8e0kpdd",
+    },
+    "eth": {
+        "label":   "ETH",
+        "network": "Ethereum · ERC20",
+        "address": "0x64609F5957Af9e0bc7c0809527BfdE6CeB1996c2",
+    },
+}
+
+TXID_RE = re.compile(r"^[A-Za-z0-9_:/+=-]{16,120}$")
+
+# user_id -> {plan, coin} while we wait for them to send a transaction ID
+_awaiting_txid: dict[int, dict] = {}
+
+def load_payments() -> dict:
+    if PAYMENTS_FILE.exists():
         try:
-            return json.loads(INVOICES_FILE.read_text())
+            return json.loads(PAYMENTS_FILE.read_text())
         except Exception:
             pass
     return {}
 
-def save_invoices(data: dict) -> None:
-    INVOICES_FILE.write_text(json.dumps(data, indent=2))
+def save_payments(data: dict) -> None:
+    PAYMENTS_FILE.write_text(json.dumps(data, indent=2))
 
-async def _cp_call(method: str, payload: dict | None = None) -> dict:
-    if not CRYPTOBOT_TOKEN:
-        raise RuntimeError("CRYPTOBOT_TOKEN is not set")
-    async with httpx.AsyncClient(timeout=20) as client:
-        r = await client.post(
-            f"{CRYPTOBOT_API}/{method}",
-            headers={"Crypto-Pay-API-Token": CRYPTOBOT_TOKEN},
-            json=payload or {},
-        )
-        r.raise_for_status()
-        body = r.json()
-    if not body.get("ok"):
-        raise RuntimeError(f"Crypto Pay error: {body.get('error')}")
-    return body["result"]
+def txid_seen(txid: str) -> bool:
+    """A transaction ID may only ever be claimed once, whatever its outcome."""
+    needle = txid.strip().lower()
+    return any(p.get("txid", "").lower() == needle for p in load_payments().values())
 
-async def cp_create_invoice(user_id: int, plan_key: str) -> dict:
-    plan = PLANS[plan_key]
-    return await _cp_call("createInvoice", {
-        "currency_type": "fiat",
-        "fiat":          "USD",
-        "amount":        plan["usd"],
-        "description":   f"Drive bot — {plan['label']}",
-        "payload":       f"{user_id}:{plan_key}",
-        "expires_in":    3600,
-        "allow_comments": False,
-    })
+def record_payment(user_id: int, plan_key: str, coin: str, txid: str) -> str:
+    data = load_payments()
+    pid  = f"{int(time.time())}{user_id % 1000:03d}"
+    data[pid] = {
+        "user_id": user_id,
+        "plan":    plan_key,
+        "coin":    coin,
+        "txid":    txid.strip(),
+        "status":  "pending",
+        "created": time.time(),
+    }
+    save_payments(data)
+    return pid
 
-async def cp_paid_invoice_ids(ids: list[str]) -> set[str]:
-    if not ids:
-        return set()
-    result = await _cp_call("getInvoices", {"invoice_ids": ",".join(ids), "status": "paid"})
-    return {str(item["invoice_id"]) for item in result.get("items", [])}
+def set_payment_status(pid: str, status: str) -> dict | None:
+    data = load_payments()
+    if pid not in data:
+        return None
+    data[pid]["status"]   = status
+    data[pid]["reviewed"] = time.time()
+    save_payments(data)
+    return data[pid]
 
-async def _activate_invoice(app: Application, invoice_id: str, rec: dict) -> None:
-    user_id  = int(rec["user_id"])
-    plan_key = rec["plan"]
-    plan     = PLANS[plan_key]
-    expiry   = grant_sub(user_id, plan["days"])
-    logger.info("Subscription activated: user=%s plan=%s invoice=%s", user_id, plan_key, invoice_id)
-    try:
-        await app.bot.send_message(
-            user_id,
-            f"✅ *Payment received!*\n\n"
-            f"Your *{plan['label']}* subscription is active until *{fmt_expiry(expiry)}*.\n\n"
-            f"You now get unlimited downloads, no {MAX_FILE_MB} MB cap, and a 30-minute timeout.",
-            parse_mode="Markdown",
-        )
-    except Exception:
-        pass
-
-async def _invoice_poller(app: Application) -> None:
-    """Every 30s, activate any pending invoice that Crypto Pay reports as paid."""
-    while True:
-        await asyncio.sleep(30)
+async def notify_admins_of_payment(context, pid: str, rec: dict) -> None:
+    if not ADMIN_IDS:
+        logger.warning("Payment %s submitted but ADMIN_IDS is empty — nobody can approve it.", pid)
+        return
+    plan = PLANS[rec["plan"]]
+    coin = WALLETS[rec["coin"]]
+    user = load_users().get(str(rec["user_id"]), {})
+    text = (
+        f"💰 *Payment submitted*\n\n"
+        f"👤 `{rec['user_id']}` — {user.get('name', 'unknown')}"
+        + (f" (@{user['username']})" if user.get("username") else "") + "\n"
+        f"📦 {plan['label']}\n"
+        f"🪙 {coin['label']} — {coin['network']}\n"
+        f"🧾 TXID:\n`{rec['txid']}`"
+    )
+    markup = InlineKeyboardMarkup([[
+        InlineKeyboardButton("✅ Approve", callback_data=f"payok:{pid}"),
+        InlineKeyboardButton("❌ Reject",  callback_data=f"payno:{pid}"),
+    ]])
+    for admin_id in ADMIN_IDS:
         try:
-            pending = load_invoices()
-            if not pending:
-                continue
-            now     = time.time()
-            stale   = [i for i, r in pending.items() if now - r.get("created", now) > 7200]
-            paid    = await cp_paid_invoice_ids(list(pending))
-            for invoice_id in paid:
-                rec = pending.get(invoice_id)
-                if rec:
-                    await _activate_invoice(app, invoice_id, rec)
-            for invoice_id in paid | set(stale):
-                pending.pop(invoice_id, None)
-            save_invoices(pending)
+            await context.bot.send_message(admin_id, text, parse_mode="Markdown", reply_markup=markup)
         except Exception as e:
-            logger.warning("Invoice poller: %s", e)
+            logger.warning("Could not notify admin %s: %s", admin_id, e)
 
 # ── ETA helper ────────────────────────────────────────────────────────────────
 
@@ -711,10 +722,6 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     register_user(update.effective_user)
     user_id = update.effective_user.id
 
-    if not CRYPTOBOT_TOKEN:
-        await update.message.reply_text("💤 Subscriptions aren't set up on this bot yet.")
-        return
-
     current = ""
     if sub_active(user_id):
         current = (
@@ -727,11 +734,10 @@ async def cmd_subscribe(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     await update.message.reply_text(
         f"{current}"
         "⭐️ *Subscription*\n\n"
-        f"• Unlimited downloads\n"
+        "• Unlimited downloads\n"
         f"• No {MAX_FILE_MB} MB size limit\n"
-        f"• 30-minute timeout instead of 5\n\n"
-        "Paid in crypto (USDT, TON, BTC and more) via @CryptoBot.\n"
-        "Pick a plan:",
+        "• 30-minute timeout instead of 5\n\n"
+        "Paid in crypto. Pick a plan:",
         reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
@@ -742,62 +748,127 @@ async def handle_sub_plan(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     plan_key = query.data.split(":", 1)[1]
     if plan_key not in PLANS:
         return
-    user_id = query.from_user.id
-
-    try:
-        invoice = await cp_create_invoice(user_id, plan_key)
-    except Exception as e:
-        logger.warning("Invoice creation failed for %s: %s", user_id, e)
-        await query.message.reply_text("❌ Couldn't create the invoice. Try again in a moment.")
-        return
-
-    invoice_id = str(invoice["invoice_id"])
-    pay_url    = invoice.get("bot_invoice_url") or invoice.get("pay_url")
-
-    pending = load_invoices()
-    pending[invoice_id] = {"user_id": user_id, "plan": plan_key, "created": time.time()}
-    save_invoices(pending)
-
+    plan = PLANS[plan_key]
+    keyboard = [[InlineKeyboardButton(w["label"], callback_data=f"coin:{plan_key}:{c}")]
+                for c, w in WALLETS.items()]
     await query.message.reply_text(
-        f"🧾 *{PLANS[plan_key]['label']}*\n\n"
-        "Tap *Pay* to complete the payment in @CryptoBot.\n"
-        "I'll confirm here automatically within a minute of payment.\n\n"
-        "_The invoice expires in 1 hour._",
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("💳 Pay", url=pay_url)],
-            [InlineKeyboardButton("🔄 I've paid — check now", callback_data=f"subchk:{invoice_id}")],
-        ]),
+        f"📦 *{plan['label']}*\n\nWhich coin do you want to pay with?",
+        reply_markup=InlineKeyboardMarkup(keyboard),
         parse_mode="Markdown",
     )
 
-async def handle_sub_check(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+async def handle_sub_coin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-    invoice_id = query.data.split(":", 1)[1]
+    await query.answer()
+    _, plan_key, coin = query.data.split(":", 2)
+    if plan_key not in PLANS or coin not in WALLETS:
+        return
 
-    pending = load_invoices()
-    rec     = pending.get(invoice_id)
-    if not rec:
-        await query.answer(
-            "Already confirmed." if sub_active(query.from_user.id) else "Invoice expired.",
-            show_alert=True,
+    plan, wallet = PLANS[plan_key], WALLETS[coin]
+    _awaiting_txid[query.from_user.id] = {"plan": plan_key, "coin": coin}
+
+    await query.message.reply_text(
+        f"📦 *{plan['label']}* — send *${plan['usd']}* worth of *{wallet['label']}*\n\n"
+        f"🌐 Network: *{wallet['network']}*\n"
+        f"📬 Address:\n`{wallet['address']}`\n\n"
+        "⚠️ Send on this exact network or the funds are lost.\n\n"
+        "➡️ After paying, *send me the transaction ID (TXID)* as your next message.",
+        parse_mode="Markdown",
+    )
+
+async def handle_txid(update: Update, context: ContextTypes.DEFAULT_TYPE) -> bool:
+    """Consume a pending TXID message. Returns True if this message was one."""
+    user_id = update.effective_user.id
+    order   = _awaiting_txid.get(user_id)
+    if not order:
+        return False
+
+    txid = (update.message.text or "").strip()
+    if not TXID_RE.match(txid):
+        await update.message.reply_text(
+            "❌ That doesn't look like a transaction ID.\n"
+            "Send the TXID/hash from your wallet, or /subscribe to start over."
         )
+        return True
+
+    if txid_seen(txid):
+        await update.message.reply_text(
+            "❌ That transaction ID has already been submitted.\n"
+            "If you think this is a mistake, contact the admin."
+        )
+        return True
+
+    _awaiting_txid.pop(user_id, None)
+    pid = record_payment(user_id, order["plan"], order["coin"], txid)
+    await notify_admins_of_payment(context, pid, load_payments()[pid])
+    await update.message.reply_text(
+        "✅ *Received.*\n\n"
+        "Your payment is being checked — you'll get a message here as soon as "
+        "it's confirmed. This usually takes a few minutes.",
+        parse_mode="Markdown",
+    )
+    return True
+
+async def handle_pay_review(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    if not ADMIN_IDS or query.from_user.id not in ADMIN_IDS:
+        await query.answer("Admin only.", show_alert=True)
         return
 
-    try:
-        paid = await cp_paid_invoice_ids([invoice_id])
-    except Exception as e:
-        logger.warning("Invoice check failed: %s", e)
-        await query.answer("Couldn't reach the payment service. Try again shortly.", show_alert=True)
+    action, pid = query.data.split(":", 1)
+    rec = load_payments().get(pid)
+    if not rec:
+        await query.answer("Unknown payment.", show_alert=True)
         return
-
-    if invoice_id not in paid:
-        await query.answer("No payment yet. If you just paid, give it a few seconds.", show_alert=True)
+    if rec["status"] != "pending":
+        await query.answer(f"Already {rec['status']}.", show_alert=True)
         return
 
     await query.answer()
-    await _activate_invoice(context.application, invoice_id, rec)
-    pending.pop(invoice_id, None)
-    save_invoices(pending)
+    plan = PLANS[rec["plan"]]
+
+    if action == "payok":
+        set_payment_status(pid, "approved")
+        expiry = grant_sub(rec["user_id"], plan["days"])
+        logger.info("Payment %s approved: user=%s plan=%s", pid, rec["user_id"], rec["plan"])
+        try:
+            await context.bot.send_message(
+                rec["user_id"],
+                f"✅ *Payment confirmed!*\n\n"
+                f"Your *{plan['label']}* subscription is active until *{fmt_expiry(expiry)}*.\n\n"
+                f"Unlimited downloads, no {MAX_FILE_MB} MB cap, 30-minute timeout.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        await query.edit_message_text(
+            f"{query.message.text}\n\n✅ Approved — active until {fmt_expiry(expiry)}."
+        )
+    else:
+        set_payment_status(pid, "rejected")
+        logger.info("Payment %s rejected: user=%s", pid, rec["user_id"])
+        try:
+            await context.bot.send_message(
+                rec["user_id"],
+                "❌ *Payment not confirmed.*\n\n"
+                "We couldn't verify that transaction. Double-check the TXID and "
+                "network, then contact the admin if you believe it's correct.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+        await query.edit_message_text(f"{query.message.text}\n\n❌ Rejected.")
+
+async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not ADMIN_IDS or update.effective_user.id not in ADMIN_IDS:
+        await update.message.reply_text("⛔ Admin only.")
+        return
+    pending = {k: v for k, v in load_payments().items() if v["status"] == "pending"}
+    if not pending:
+        await update.message.reply_text("✅ No payments waiting for review.")
+        return
+    for pid, rec in sorted(pending.items()):
+        await notify_admins_of_payment(context, pid, rec)
 
 async def handle_dl_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
@@ -929,6 +1000,8 @@ def _safe_display_url(url: str) -> str:
 
 async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     register_user(update.effective_user)
+    if await handle_txid(update, context):
+        return
     text  = update.message.text or ""
     match = URL_RE.search(text)
     if not match:
@@ -1861,11 +1934,6 @@ async def on_startup(app: Application) -> None:
     logger.info("Local janitor started (cleans files older than %d min).", LOCAL_MAX_AGE // 60)
     _health_server = await asyncio.start_server(_health_handler, "0.0.0.0", HEALTH_PORT)
     logger.info("Health check running on http://0.0.0.0:%d", HEALTH_PORT)
-    if CRYPTOBOT_TOKEN:
-        asyncio.create_task(_invoice_poller(app))
-        logger.info("Crypto Pay invoice poller started.")
-    else:
-        logger.warning("CRYPTOBOT_TOKEN not set — /subscribe is disabled.")
 
 async def on_shutdown(app: Application) -> None:
     global _health_server
@@ -1904,8 +1972,10 @@ def main() -> None:
     app.add_handler(CommandHandler("users",     cmd_users))
     app.add_handler(CommandHandler("vip",       cmd_vip))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
-    app.add_handler(CallbackQueryHandler(handle_sub_plan,  pattern=r"^sub:"))
-    app.add_handler(CallbackQueryHandler(handle_sub_check, pattern=r"^subchk:"))
+    app.add_handler(CommandHandler("payments",  cmd_payments))
+    app.add_handler(CallbackQueryHandler(handle_sub_plan,   pattern=r"^sub:"))
+    app.add_handler(CallbackQueryHandler(handle_sub_coin,   pattern=r"^coin:"))
+    app.add_handler(CallbackQueryHandler(handle_pay_review, pattern=r"^pay(ok|no):"))
     app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
     app.add_handler(CallbackQueryHandler(handle_dl_help,  pattern=r"^dlhelp$"))
     app.add_handler(MessageHandler(media_filter, handle_file))

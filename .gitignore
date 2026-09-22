@@ -4,7 +4,7 @@ gdrive_token.json
 *.session-journal
 deletions.json
 subs.json
-invoices.json
+payments.json
 users.json
 vip.json
 .env

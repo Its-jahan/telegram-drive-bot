@@ -27,10 +27,8 @@ Environment=GDRIVE_FOLDER=TelegramDownloads
 Environment=TOKEN_FILE=/opt/dlbot/gdrive_token.json
 Environment=SCHEDULE_FILE=/opt/dlbot/deletions.json
 Environment=OAUTH_PORT=8888
-# Token from @CryptoBot -> Crypto Pay -> My Apps (leave empty to disable /subscribe)
-Environment=CRYPTOBOT_TOKEN=
 Environment=SUBS_FILE=/opt/dlbot/subs.json
-Environment=INVOICES_FILE=/opt/dlbot/invoices.json
+Environment=PAYMENTS_FILE=/opt/dlbot/payments.json
 # Comma-separated Telegram user IDs allowed to use the bot (leave empty = public)
 Environment=ADMIN_IDS=
 
