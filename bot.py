@@ -287,6 +287,12 @@ TXID_RE = re.compile(r"^[A-Za-z0-9_:/+=-]{16,120}$")
 # user_id -> {plan, coin} while we wait for them to send a transaction ID
 _awaiting_txid: dict[int, dict] = {}
 
+# user_id -> [item, ...] while a user is collecting files for one archive
+_batches: dict[int, list] = {}
+# prompt message_id -> batch awaiting its duration choice
+_pending_batches: dict[int, dict] = {}
+BATCH_MAX_ITEMS = 25
+
 def load_payments() -> dict:
     if PAYMENTS_FILE.exists():
         try:
@@ -404,6 +410,18 @@ def get_or_create_folder(service, name: str) -> str:
         return items[0]["id"]
     meta = {"name": name, "mimeType": "application/vnd.google-apps.folder"}
     return service.files().create(body=meta, fields="id").execute()["id"]
+
+def _unique_path(folder: Path, name: str) -> Path:
+    """A free path in folder — two batch items may share a filename."""
+    candidate = folder / name
+    if not candidate.exists():
+        return candidate
+    stem, suffix = candidate.stem, candidate.suffix
+    for n in range(2, 1000):
+        candidate = folder / f"{stem} ({n}){suffix}"
+        if not candidate.exists():
+            return candidate
+    return folder / f"{stem}-{int(time.time())}{suffix}"
 
 def _make_bar(pct: int, width: int = 20) -> str:
     filled = int(width * pct / 100)
@@ -621,7 +639,8 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "👋 *Internet → Google Drive Bot*\n\n"
         "I can save files to Google Drive in two ways:\n\n"
         "🔗 *Send a download link* — I'll download it on the server\n"
-        "📨 *Forward any message* — I'll grab the attached file directly\n\n"
+        "📨 *Forward any message* — I'll grab the attached file directly\n"
+        "📦 */batch* — collect several files and get them as one zip\n\n"
         + ("🔒 *A subscription is required* — see /subscribe\n\n"
            if not has_access(update.effective_user.id) else
            "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
@@ -888,6 +907,72 @@ async def cmd_payments(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for pid, rec in sorted(pending.items()):
         await notify_admins_of_payment(context, pid, rec)
 
+async def cmd_batch(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    register_user(update.effective_user)
+    user_id = update.effective_user.id
+    if not has_access(user_id):
+        await deny_unsubscribed(update)
+        return
+    if not load_creds():
+        await update.message.reply_text("⚠️ Google Drive not connected. Run /auth first.")
+        return
+
+    _batches[user_id] = []
+    await update.message.reply_text(
+        "📦 *Batch started.*\n\n"
+        "Send me links and files — I'll collect them.\n"
+        f"Up to *{BATCH_MAX_ITEMS}* items.\n\n"
+        "/done — zip everything into one file\n"
+        "/cancel — throw it away",
+        parse_mode="Markdown",
+    )
+
+async def cmd_batch_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    items = _batches.pop(update.effective_user.id, None)
+    await update.message.reply_text(
+        f"🗑 Batch cancelled ({len(items)} item(s) discarded)." if items
+        else "Nothing to cancel."
+    )
+
+async def cmd_batch_done(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    user_id = update.effective_user.id
+    items   = _batches.get(user_id)
+    if items is None:
+        await update.message.reply_text("No batch in progress. Start one with /batch.")
+        return
+    if not items:
+        await update.message.reply_text("Batch is empty — send some links or files first.")
+        return
+
+    listing = "\n".join(f"{i}. `{it['name'][:48]}`" for i, it in enumerate(items, 1))
+    prompt = await update.message.reply_text(
+        f"📦 *{len(items)} item(s) ready*\n\n{listing}\n\n"
+        "How long should the archive be kept on Google Drive?",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup([
+            [InlineKeyboardButton("⏱ 1 hour",   callback_data="bdur:1h"),
+             InlineKeyboardButton("⏱ 5 hours",  callback_data="bdur:5h")],
+            [InlineKeyboardButton("⏱ 12 hours", callback_data="bdur:12h"),
+             InlineKeyboardButton("📅 1 day",    callback_data="bdur:1d")],
+        ]),
+    )
+    # hand the items to the prompt; a new /batch shouldn't mutate this one
+    _pending_batches[prompt.message_id] = {
+        "items":   _batches.pop(user_id),
+        "user_id": user_id,
+        "is_vip":  is_privileged(user_id),
+    }
+
+def batch_add(user_id: int, item: dict) -> int | None:
+    """Append to an open batch. Returns the new count, or None if no batch is open."""
+    items = _batches.get(user_id)
+    if items is None:
+        return None
+    if len(items) >= BATCH_MAX_ITEMS:
+        return -1
+    items.append(item)
+    return len(items)
+
 async def handle_dl_help(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
@@ -1038,6 +1123,20 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
         await update.message.reply_text(_BLOCKED_REPLY)
         return
 
+    name  = url.split("/")[-1].split("?")[0] or url[:40]
+    count = batch_add(update.effective_user.id, {"kind": "url", "url": url, "name": name})
+    if count == -1:
+        await update.message.reply_text(
+            f"📦 Batch is full ({BATCH_MAX_ITEMS} items). Send /done to package it."
+        )
+        return
+    if count is not None:
+        await update.message.reply_text(
+            f"📦 Added *{count}*: `{name[:48]}`\n\n/done to package · /cancel to discard",
+            parse_mode="Markdown",
+        )
+        return
+
     is_vip       = is_privileged(update.effective_user.id)
     vip_tag      = status_tag(update.effective_user.id)
 
@@ -1096,6 +1195,25 @@ async def handle_file(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await msg.reply_text(
             f"❌ File is too large ({size_mb:.0f} MB).\n"
             f"Maximum supported size is *{MAX_FILE_MB} MB*.",
+            parse_mode="Markdown",
+        )
+        return
+
+    count = batch_add(update.effective_user.id, {
+        "kind":       "tg",
+        "tg_file_id": tg_obj.file_id,
+        "chat_id":    msg.chat_id,
+        "msg_id":     msg.message_id,
+        "name":       fname,
+        "size_mb":    size_mb,
+    })
+    if count == -1:
+        await msg.reply_text(f"📦 Batch is full ({BATCH_MAX_ITEMS} items). Send /done to package it.")
+        return
+    if count is not None:
+        await msg.reply_text(
+            f"📦 Added *{count}*: `{fname[:48]}` ({size_mb:.1f} MB)\n\n"
+            "/done to package · /cancel to discard",
             parse_mode="Markdown",
         )
         return
@@ -1187,6 +1305,232 @@ async def handle_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             user_id=user_id,
         )
     )
+
+async def handle_batch_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+
+    label, seconds = DURATIONS[query.data.split(":")[1]]
+    msg_id  = query.message.message_id
+    batch   = _pending_batches.pop(msg_id, None)
+    if not batch:
+        await query.edit_message_text("⚠️ Session expired. Start again with /batch.")
+        return
+
+    chat_id = update.effective_chat.id
+    task_id = f"{chat_id}:{msg_id}"
+    _tasks[task_id] = {
+        "filename":   f"batch of {len(batch['items'])}",
+        "size_mb":    None,
+        "status":     "waiting",
+        "pct":        0,
+        "started_at": time.time(),
+        "label":      label,
+        "is_vip":     batch["is_vip"],
+    }
+
+    await query.edit_message_text(
+        f"⏳ Queued! Packaging *{len(batch['items'])}* item(s)…\n"
+        f"🗑 Will be deleted after *{label}*",
+        parse_mode="Markdown",
+    )
+
+    _active_tasks[task_id] = asyncio.create_task(
+        _run_batch_with_timeout(
+            task_id=task_id, bot=context.bot, chat_id=chat_id, msg_id=msg_id,
+            items=batch["items"], label=label, seconds=seconds,
+            is_vip=batch["is_vip"], user_id=batch["user_id"],
+        )
+    )
+
+async def _run_batch_with_timeout(task_id, bot, chat_id, msg_id, items, label, seconds,
+                                  is_vip=False, user_id=None):
+    timeout = 3600 if is_vip else REQUEST_TIMEOUT
+    try:
+        await asyncio.wait_for(
+            _do_batch(task_id, bot, chat_id, msg_id, items, label, seconds, is_vip, user_id),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "timeout"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=f"⏰ *Batch timed out* after {timeout // 60} minutes.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception("Batch task %s failed", task_id)
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "error"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=f"❌ Unexpected error: {e}"
+            )
+        except Exception:
+            pass
+    finally:
+        _active_tasks.pop(task_id, None)
+
+async def _do_batch(task_id, bot, chat_id, msg_id, items, label, seconds,
+                    is_vip=False, user_id=None):
+    """Download every item into one folder, then upload it as a single zip."""
+
+    def _task_set(status: str, pct: int = 0) -> None:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = status
+            _tasks[task_id]["pct"]    = pct
+
+    _last_edit = [0.0]
+    async def _edit(text: str, force: bool = True, reply_markup=None) -> None:
+        now = time.time()
+        if not force and now - _last_edit[0] < 3.0:
+            return
+        _last_edit[0] = now
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id, text=text,
+                parse_mode="Markdown", reply_markup=reply_markup,
+            )
+        except Exception:
+            pass
+
+    _health["last_activity"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    stamp      = time.strftime("%Y%m%d-%H%M%S", time.gmtime())
+    batch_dir  = DOWNLOAD_DIR / f"batch-{stamp}-{chat_id}"
+    batch_dir.mkdir(parents=True, exist_ok=True)
+
+    total   = len(items)
+    failed: list[str] = []
+
+    try:
+        _health["active_downloads"] += 1
+        async with DOWNLOAD_SEMAPHORE:
+            for idx, item in enumerate(items, 1):
+                name = item["name"]
+                _task_set("downloading", int((idx - 1) / total * 100))
+
+                async def _prog(pct: int, _n=name, _i=idx) -> None:
+                    await _edit(
+                        f"📥 *{_i}/{total}* — `{_n[:42]}`\n\n"
+                        f"`{_make_bar(pct)}` {pct}%\n\n"
+                        f"🗑 Will be deleted after *{label}*",
+                        force=False,
+                    )
+
+                await _edit(
+                    f"📥 *{idx}/{total}* — `{name[:42]}`\n\n"
+                    f"🗑 Will be deleted after *{label}*"
+                )
+
+                try:
+                    if item["kind"] == "url":
+                        before = set(batch_dir.iterdir())
+                        rc, out, err = await run_aria2(item["url"], batch_dir, on_progress=_prog)
+                        if rc != 0 or not (set(batch_dir.iterdir()) - before):
+                            failed.append(name)
+                    else:
+                        dest = _unique_path(batch_dir, name)
+                        if item["size_mb"] > TG_BOT_API_LIMIT_MB:
+                            await ensure_pyro()
+                            pyro_msg = await pyro.get_messages(item["chat_id"], item["msg_id"])
+
+                            async def _cb(current, tot, _p=_prog):
+                                await _p(int(current / tot * 100) if tot else 0)
+
+                            await pyro.download_media(pyro_msg, file_name=str(dest), progress=_cb)
+                        else:
+                            tg_file = await bot.get_file(item["tg_file_id"])
+                            await tg_file.download_to_drive(str(dest))
+                except Exception as e:
+                    logger.warning("Batch item %s failed: %s", name, e)
+                    failed.append(name)
+
+        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+
+        got = [f for f in batch_dir.rglob("*") if f.is_file()]
+        if not got:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            await _edit("❌ Nothing downloaded — every item failed.")
+            return
+
+        size_mb = sum(f.stat().st_size for f in got) / (1024 * 1024)
+        if size_mb > MAX_FILE_MB and not is_vip:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            await _edit(
+                f"❌ The archive would be {size_mb:.0f} MB.\n"
+                f"Maximum is *{MAX_FILE_MB} MB*."
+            )
+            return
+
+        _task_set("uploading", 0)
+        await _edit(
+            f"✅ Got *{len(got)}* file(s) ({size_mb:.1f} MB)\n"
+            f"🗜 Zipping and uploading to Google Drive…\n\n"
+            f"🗑 Will be deleted after *{label}*"
+        )
+
+        _up_start = time.time()
+        async def _up_prog(pct: int) -> None:
+            _task_set("uploading", pct)
+            eta = _fmt_eta(_up_start, pct)
+            await _edit(
+                f"☁️ Uploading `{batch_dir.name}.zip`…\n\n"
+                f"`{_make_bar(pct)}` {pct}%" + (f"\n⏱ {eta}" if eta else "") + "\n\n"
+                f"🗑 Will be deleted after *{label}*",
+                force=False,
+            )
+
+        try:
+            drive_file_id, _ = await upload_to_drive(batch_dir, on_progress=_up_prog)
+        except Exception as e:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            await _edit(f"❌ Upload failed: {e}")
+            return
+
+        _task_set("done", 100)
+        asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
+        _health["total_uploads"] += 1
+
+        zip_name   = f"{batch_dir.name}.zip"
+        drive_view = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
+        api_link   = (
+            f"https://www.googleapis.com/drive/v3/files/{drive_file_id}"
+            f"?alt=media&key={GOOGLE_API_KEY}"
+            if GOOGLE_API_KEY else drive_view
+        )
+        skipped = (
+            "\n\n⚠️ Skipped: " + ", ".join(f"`{n[:24]}`" for n in failed[:5])
+            + (f" +{len(failed) - 5} more" if len(failed) > 5 else "")
+            if failed else ""
+        )
+        await _edit(
+            f"✅ *Done!*\n\n"
+            f"📁 `{zip_name}`\n"
+            f"🗂 {len(got)} file(s) · {size_mb:.1f} MB\n"
+            f"🗑 Auto-delete in: *{label}*{skipped}\n\n"
+            f"1️⃣ [Google Drive]({drive_view})\n"
+            f"2️⃣ [Direct download]({api_link})",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("🔧 Trouble downloading?", callback_data="dlhelp")
+            ]]),
+        )
+
+        asyncio.create_task(
+            schedule_deletion(drive_file_id, zip_name, seconds, bot, chat_id)
+        )
+    finally:
+        shutil.rmtree(batch_dir, ignore_errors=True)
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
@@ -1996,10 +2340,14 @@ def main() -> None:
     app.add_handler(CommandHandler("vip",       cmd_vip))
     app.add_handler(CommandHandler("subscribe", cmd_subscribe))
     app.add_handler(CommandHandler("payments",  cmd_payments))
+    app.add_handler(CommandHandler("batch",     cmd_batch))
+    app.add_handler(CommandHandler("done",      cmd_batch_done))
+    app.add_handler(CommandHandler("cancel",    cmd_batch_cancel))
     app.add_handler(CallbackQueryHandler(handle_sub_plan,   pattern=r"^sub:"))
     app.add_handler(CallbackQueryHandler(handle_sub_coin,   pattern=r"^coin:"))
     app.add_handler(CallbackQueryHandler(handle_pay_review, pattern=r"^pay(ok|no):"))
-    app.add_handler(CallbackQueryHandler(handle_duration, pattern=r"^dur:"))
+    app.add_handler(CallbackQueryHandler(handle_duration,       pattern=r"^dur:"))
+    app.add_handler(CallbackQueryHandler(handle_batch_duration, pattern=r"^bdur:"))
     app.add_handler(CallbackQueryHandler(handle_dl_help,  pattern=r"^dlhelp$"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))

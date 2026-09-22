@@ -33,6 +33,7 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | 🔍 | Pre-flight size check before download starts |
 | 🌟 | VIP system: bypass size limit & extended timeout |
 | ⭐️ | Paid subscriptions — $2/month or $5/3 months, paid in crypto |
+| 📦 | Batch mode — combine many files/links into a single zip |
 | 🖥️ | Health dashboard with Kill All & Restart buttons |
 | 🔒 | Optional user allowlist |
 
@@ -194,6 +195,9 @@ ufw allow 8888/tcp
 | `/auth` | Everyone | Re-authorise Google Drive |
 | `/vip` | Admin only | List all VIP users and their credits |
 | `/vip <user_id> <credits>` | Admin only | Grant VIP credits to a user |
+| `/batch` | Everyone | Start collecting files into one archive |
+| `/done` | Everyone | Package the batch and pick a retention time |
+| `/cancel` | Everyone | Discard the current batch |
 | `/subscribe` | Everyone | Buy a subscription with crypto |
 | `/payments` | Admin only | Re-send any payments awaiting review |
 
