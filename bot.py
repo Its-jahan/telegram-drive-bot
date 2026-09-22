@@ -746,15 +746,27 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     status = ("✅ Google Drive connected." if load_creds()
               else drive_offline_text(update.effective_user.id))
     await update.message.reply_text(
-        "👋 *Internet → Google Drive Bot*\n\n"
-        "I can save files to Google Drive in two ways:\n\n"
-        "🔗 *Send a download link* — I'll download it on the server\n"
-        "📨 *Forward any message* — I'll grab the attached file directly\n"
-        "📦 */batch* — collect several files and get them as one zip\n\n"
-        + (f"🎁 *{trial_left(update.effective_user.id)} free download(s)* left — try it now\n\n"
+        "👋 *Save anything to Google Drive or Telegram*\n\n"
+        "*What you can send me*\n"
+        "🔗 Any download link — I fetch it on my server\n"
+        "🎬 A video link — YouTube, TikTok, Instagram, Facebook, Bilibili, "
+        "Youku and 1800+ other sites\n"
+        "📨 Any forwarded file, up to 2 GB\n\n"
+        "*Video links let you choose*\n"
+        "📤 Telegram · ☁️ Google Drive · or both\n\n"
+        "*Commands*\n"
+        "📦 /batch — send several links or files, get one zip back\n"
+        "📊 /me — your plan, trial and referrals\n"
+        "🎁 /invite — invite friends, earn free days\n"
+        "⭐️ /subscribe — plans and payment\n\n"
+        "*Good to know*\n"
+        "⏱ Files auto-delete from Drive after 1 h, 5 h, 12 h, 1, 2 or 4 days\n"
+        "🌍 Every Drive file also gets a direct link that works behind filtering\n"
+        "👥 Add me to a group and I'll offer to fetch video links there too\n\n"
+        + (f"🎁 *{trial_left(update.effective_user.id)} free download(s)* left — try one now\n\n"
            if trial_left(update.effective_user.id) > 0
               and not is_privileged(update.effective_user.id) else
-           "🔒 *Trial used up* — see /subscribe\n\n"
+           "🔒 *Trial used up* — /subscribe to keep going\n\n"
            if not has_access(update.effective_user.id) else
            "📦 No size limit · ⏱ 30-minute timeout per file\n\n")
         + f"{status}{status_tag(update.effective_user.id)}",
