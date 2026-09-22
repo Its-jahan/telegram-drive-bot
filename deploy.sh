@@ -31,7 +31,7 @@ else
   copy "$SRC/dlbot.service" "/etc/systemd/system/dlbot.service"
 fi
 
-run "command -v aria2c >/dev/null || { apt-get update -q && apt-get install -y -q aria2; }"
+run "command -v aria2c >/dev/null && command -v ffmpeg >/dev/null || { apt-get update -q && apt-get install -y -q aria2 ffmpeg; }"
 run "pip3 install --break-system-packages -q -r $REMOTE_DIR/requirements.txt"
 run "systemctl daemon-reload && systemctl enable --now dlbot && systemctl restart dlbot"
 sleep 3

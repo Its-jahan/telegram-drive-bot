@@ -16,6 +16,7 @@ import re
 import shutil
 import time
 from pathlib import Path
+from urllib.parse import urlparse
 
 from google.oauth2.credentials import Credentials
 from google.auth.transport.requests import Request
@@ -90,6 +91,7 @@ def _is_blocked(text: str) -> bool:
 
 MAX_FILE_MB         = 800    # Hard cap for users
 TG_BOT_API_LIMIT_MB = 20     # Bot API hard cap; above this → Pyrogram
+TG_UPLOAD_LIMIT_MB  = 2000   # what a bot can send out over MTProto
 REQUEST_TIMEOUT     = 300    # 5 minutes max per request (download + upload)
 
 # Limit concurrent downloads so RAM never spikes
@@ -374,6 +376,8 @@ _awaiting_txid: dict[int, dict] = {}
 _batches: dict[int, list] = {}
 # prompt message_id -> batch awaiting its duration choice
 _pending_batches: dict[int, dict] = {}
+# prompt message_id -> video awaiting a destination / duration choice
+_pending_videos: dict[int, dict] = {}
 BATCH_MAX_ITEMS = 25
 
 def load_payments() -> dict:
@@ -1144,6 +1148,66 @@ async def get_url_size_mb(url: str) -> float | None:
         pass
     return None
 
+VIDEO_HOSTS = {
+    "youtube.com", "youtu.be", "tiktok.com", "instagram.com", "facebook.com",
+    "fb.watch", "bilibili.com", "youku.com", "twitter.com", "x.com", "vimeo.com",
+    "dailymotion.com", "reddit.com", "twitch.tv", "soundcloud.com", "threads.net",
+    "pinterest.com", "snapchat.com", "vk.com", "ok.ru", "rutube.ru", "weibo.com",
+    "douyin.com", "kuaishou.com", "nicovideo.jp", "odysee.com", "rumble.com",
+    "aparat.com", "telewebion.com",
+}
+
+def is_video_site(url: str) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host.startswith("m."):
+        host = host[2:]
+    return any(host == d or host.endswith("." + d) for d in VIDEO_HOSTS)
+
+_YTDLP_PCT = re.compile(r"\[download\]\s+(\d{1,3})(?:\.\d+)?%")
+
+async def run_ytdlp(url: str, dest_dir: Path, on_progress=None) -> tuple[int, str, str]:
+    """Fetch a video with yt-dlp. Progress is reported 0-100 as it downloads."""
+    proc = await asyncio.create_subprocess_exec(
+        "yt-dlp",
+        "--no-playlist",
+        "--newline",
+        "--no-warnings",
+        "--restrict-filenames",
+        "--merge-output-format", "mp4",
+        "-f", "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+        "-o", str(dest_dir / "%(title).80s.%(ext)s"),
+        url,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+
+    out_lines: list[str] = []
+    last_pct = [-1]
+
+    async def _stream(pipe, sink) -> None:
+        async for raw in pipe:
+            line = raw.decode(errors="ignore").strip()
+            sink.append(line)
+            m = _YTDLP_PCT.search(line)
+            if m and on_progress:
+                pct = int(m.group(1))
+                if pct != last_pct[0]:
+                    last_pct[0] = pct
+                    try:
+                        await on_progress(pct)
+                    except Exception:
+                        pass
+
+    err_lines: list[str] = []
+    await asyncio.gather(
+        _stream(proc.stdout, out_lines),
+        _stream(proc.stderr, err_lines),
+    )
+    rc = await proc.wait()
+    return rc, "\n".join(out_lines), "\n".join(err_lines)
+
 async def run_aria2(url: str, dest_dir: Path, on_progress=None) -> tuple[int, str, str]:
     """Run aria2c and stream stderr so on_progress(0-100) is called in real-time.
     Handles ftp://user:pass@host/path by stripping creds into separate flags."""
@@ -1354,6 +1418,22 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
 
     is_vip       = is_privileged(update.effective_user.id)
     vip_tag      = status_tag(update.effective_user.id)
+
+    if is_video_site(url):
+        prompt = await update.message.reply_text(
+            f"🎬 *Video link detected*\n`{display_url[:70]}`{vip_tag}\n\n"
+            "Where do you want it?",
+            parse_mode="Markdown",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("📤 Telegram", callback_data="vdest:tg")],
+                [InlineKeyboardButton("☁️ Google Drive", callback_data="vdest:drive")],
+                [InlineKeyboardButton("📤 + ☁️ Both", callback_data="vdest:both")],
+            ]),
+        )
+        _pending_videos[prompt.message_id] = {
+            "url": url, "user_id": update.effective_user.id, "is_vip": is_vip,
+        }
+        return
 
     msg = await update.message.reply_text(
         f"🔗 Link received!\n`{display_url[:80]}`{vip_tag}\n\nHow long should this file be stored on Google Drive?",
@@ -1648,7 +1728,8 @@ async def _do_batch(task_id, bot, chat_id, msg_id, items, label, seconds,
                 try:
                     if item["kind"] == "url":
                         before = set(batch_dir.iterdir())
-                        rc, out, err = await run_aria2(item["url"], batch_dir, on_progress=_prog)
+                        fetch  = run_ytdlp if is_video_site(item["url"]) else run_aria2
+                        rc, out, err = await fetch(item["url"], batch_dir, on_progress=_prog)
                         if rc != 0 or not (set(batch_dir.iterdir()) - before):
                             failed.append(name)
                     else:
@@ -1746,6 +1827,230 @@ async def _do_batch(task_id, bot, chat_id, msg_id, items, label, seconds,
         )
     finally:
         shutil.rmtree(batch_dir, ignore_errors=True)
+
+async def handle_video_dest(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    dest   = query.data.split(":", 1)[1]
+    msg_id = query.message.message_id
+    info   = _pending_videos.get(msg_id)
+    if not info:
+        await query.edit_message_text("⚠️ Session expired. Send the link again.")
+        return
+    info["dest"] = dest
+
+    # only a Drive copy needs an expiry
+    if dest == "tg":
+        _pending_videos.pop(msg_id, None)
+        await _launch_video(context, update.effective_chat.id, msg_id, info, "", 0)
+        return
+
+    await query.edit_message_text(
+        "🎬 How long should the Drive copy be kept?",
+        reply_markup=_duration_keyboard("vdur"),
+    )
+
+async def handle_video_duration(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    query = update.callback_query
+    await query.answer()
+    label, seconds, _ = DURATIONS[query.data.split(":")[1]]
+    msg_id = query.message.message_id
+    info   = _pending_videos.pop(msg_id, None)
+    if not info:
+        await query.edit_message_text("⚠️ Session expired. Send the link again.")
+        return
+    await _launch_video(context, update.effective_chat.id, msg_id, info, label, seconds)
+
+async def _launch_video(context, chat_id, msg_id, info, label, seconds) -> None:
+    task_id = f"{chat_id}:{msg_id}"
+    _tasks[task_id] = {
+        "filename": "video", "size_mb": None, "status": "waiting", "pct": 0,
+        "started_at": time.time(), "label": label or "—", "is_vip": info["is_vip"],
+    }
+    try:
+        await context.bot.edit_message_text(
+            chat_id=chat_id, message_id=msg_id,
+            text="⏳ Queued! Fetching video…",
+        )
+    except Exception:
+        pass
+    _active_tasks[task_id] = asyncio.create_task(
+        _run_video_with_timeout(
+            task_id=task_id, bot=context.bot, chat_id=chat_id, msg_id=msg_id,
+            url=info["url"], dest=info["dest"], label=label, seconds=seconds,
+            is_vip=info["is_vip"], user_id=info["user_id"],
+        )
+    )
+
+async def _run_video_with_timeout(task_id, bot, chat_id, msg_id, url, dest, label, seconds,
+                                  is_vip=False, user_id=None):
+    timeout = 1800 if is_vip else REQUEST_TIMEOUT
+    try:
+        await asyncio.wait_for(
+            _do_video(task_id, bot, chat_id, msg_id, url, dest, label, seconds, is_vip, user_id),
+            timeout=timeout,
+        )
+    except asyncio.TimeoutError:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "timeout"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=msg_id,
+                text=f"⏰ *Timed out* after {timeout // 60} minutes.",
+                parse_mode="Markdown",
+            )
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise
+    except Exception as e:
+        logger.exception("Video task %s failed", task_id)
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = "error"
+        asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id,
+                                        text=f"❌ Unexpected error: {e}")
+        except Exception:
+            pass
+    finally:
+        _active_tasks.pop(task_id, None)
+
+async def _do_video(task_id, bot, chat_id, msg_id, url, dest, label, seconds,
+                    is_vip=False, user_id=None):
+    """yt-dlp the link, then deliver it to Telegram, Drive, or both."""
+
+    def _task_set(status: str, pct: int = 0, filename: str | None = None) -> None:
+        if task_id in _tasks:
+            _tasks[task_id]["status"] = status
+            _tasks[task_id]["pct"]    = pct
+            if filename:
+                _tasks[task_id]["filename"] = filename
+
+    _last = [0.0]
+    async def _edit(text: str, force: bool = True, reply_markup=None) -> None:
+        now = time.time()
+        if not force and now - _last[0] < 3.0:
+            return
+        _last[0] = now
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=msg_id, text=text,
+                                        parse_mode="Markdown", reply_markup=reply_markup)
+        except Exception:
+            pass
+
+    _health["last_activity"] = time.strftime("%Y-%m-%d %H:%M UTC", time.gmtime())
+    work = DOWNLOAD_DIR / f"video-{int(time.time())}-{chat_id}"
+    work.mkdir(parents=True, exist_ok=True)
+
+    try:
+        _task_set("downloading")
+        _start = time.time()
+
+        async def _prog(pct: int) -> None:
+            _task_set("downloading", pct)
+            eta = _fmt_eta(_start, pct)
+            await _edit(
+                f"🎬 Downloading video…\n\n`{_make_bar(pct)}` {pct}%"
+                + (f"\n⏱ {eta}" if eta else ""),
+                force=False,
+            )
+
+        await _edit("🎬 Fetching video info…")
+        _health["active_downloads"] += 1
+        async with DOWNLOAD_SEMAPHORE:
+            rc, out, err = await run_ytdlp(url, work, on_progress=_prog)
+        _health["active_downloads"] = max(0, _health["active_downloads"] - 1)
+
+        files = [f for f in work.rglob("*") if f.is_file()]
+        if rc != 0 or not files:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            reason = (err or out or "").strip().splitlines()
+            tail = reason[-1][:300] if reason else "unknown error"
+            await _edit(f"❌ Couldn't download that video.\n```{tail}```")
+            return
+
+        video   = max(files, key=lambda f: f.stat().st_size)
+        size_mb = video.stat().st_size / (1024 * 1024)
+        _task_set("uploading", 0, video.name)
+
+        if size_mb > MAX_FILE_MB and not is_vip:
+            _task_set("error")
+            asyncio.get_event_loop().call_later(30, _tasks.pop, task_id, None)
+            await _edit(
+                f"❌ Video is {size_mb:.0f} MB — over the *{MAX_FILE_MB} MB* limit.\n"
+                "/subscribe to lift it."
+            )
+            return
+
+        lines = [f"✅ *{video.name}*", f"📦 {size_mb:.1f} MB"]
+
+        # ── Telegram copy ─────────────────────────────────────────────────────
+        if dest in ("tg", "both"):
+            if size_mb > TG_UPLOAD_LIMIT_MB:
+                lines.append(f"📤 Telegram: ❌ too large (limit {TG_UPLOAD_LIMIT_MB} MB)")
+            else:
+                await _edit(f"📤 Sending `{video.name}` to Telegram…\n📦 {size_mb:.1f} MB")
+                try:
+                    await ensure_pyro()
+                    await pyro.send_video(
+                        chat_id, str(video),
+                        caption=video.name[:1000],
+                        supports_streaming=True,
+                    )
+                    lines.append("📤 Telegram: ✅ sent")
+                except Exception as e:
+                    logger.warning("Telegram send failed: %s", e)
+                    lines.append(f"📤 Telegram: ❌ {e}")
+
+        # ── Drive copy ────────────────────────────────────────────────────────
+        if dest in ("drive", "both"):
+            _up = time.time()
+            async def _up_prog(pct: int) -> None:
+                _task_set("uploading", pct)
+                eta = _fmt_eta(_up, pct)
+                await _edit(
+                    f"☁️ Uploading `{video.name}`…\n\n`{_make_bar(pct)}` {pct}%"
+                    + (f"\n⏱ {eta}" if eta else ""),
+                    force=False,
+                )
+            try:
+                drive_file_id, _ = await upload_to_drive(video, on_progress=_up_prog)
+                view = f"https://drive.google.com/file/d/{drive_file_id}/view?usp=sharing"
+                api  = (f"https://www.googleapis.com/drive/v3/files/{drive_file_id}"
+                        f"?alt=media&key={GOOGLE_API_KEY}" if GOOGLE_API_KEY else view)
+                lines += [
+                    f"🗑 Auto-delete in: *{label}*",
+                    f"1️⃣ [Google Drive]({view})",
+                    f"2️⃣ [Direct download]({api})",
+                ]
+                asyncio.create_task(
+                    schedule_deletion(drive_file_id, video.name, seconds, bot, chat_id)
+                )
+            except Exception as e:
+                logger.warning("Drive upload failed: %s", e)
+                lines.append(f"☁️ Drive: ❌ {e}")
+
+        _task_set("done", 100)
+        asyncio.get_event_loop().call_later(60, _tasks.pop, task_id, None)
+        _health["total_uploads"] += 1
+
+        if user_id and user_id not in ADMIN_IDS and not sub_active(user_id):
+            if get_vip_credits(user_id) > 0:
+                left = consume_vip_credit(user_id)
+                lines.append(f"🌟 VIP credit used · *{left}* left")
+            else:
+                left = consume_trial(user_id)
+                lines.append(
+                    f"🎁 Free trial — *{left}* download(s) left" if left > 0
+                    else "🎁 That was your last free download — /subscribe to continue"
+                )
+
+        await _edit("\n".join(lines))
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
 
 # ── Background worker ─────────────────────────────────────────────────────────
 
@@ -2585,6 +2890,8 @@ def main() -> None:
     app.add_handler(CallbackQueryHandler(handle_pay_review, pattern=r"^pay(ok|no):"))
     app.add_handler(CallbackQueryHandler(handle_duration,       pattern=r"^dur:"))
     app.add_handler(CallbackQueryHandler(handle_batch_duration, pattern=r"^bdur:"))
+    app.add_handler(CallbackQueryHandler(handle_video_dest,     pattern=r"^vdest:"))
+    app.add_handler(CallbackQueryHandler(handle_video_duration, pattern=r"^vdur:"))
     app.add_handler(CallbackQueryHandler(handle_dl_help,  pattern=r"^dlhelp$"))
     app.add_handler(MessageHandler(media_filter, handle_file))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_url))

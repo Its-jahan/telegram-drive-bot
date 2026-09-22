@@ -34,6 +34,8 @@ A self-hosted Telegram bot that accepts any download URL **or forwarded file**, 
 | 🌟 | VIP system: bypass size limit & extended timeout |
 | ⭐️ | Paid subscriptions — $2/month or $5/3 months, paid in crypto |
 | 📦 | Batch mode — combine many files/links into a single zip |
+| 🎬 | Video downloads via yt-dlp — YouTube, TikTok, Instagram, Facebook, Bilibili, Youku and 1800+ sites |
+| 📲 | Choose delivery: straight to Telegram, to Google Drive, or both |
 | 🎁 | Free trial for new users, then a paywall |
 | 🤝 | Referral links — inviters earn free days when invitees subscribe |
 | ⌨️ | Quick-action buttons and a Telegram command menu |
@@ -80,7 +82,7 @@ Bot:   🗑 File movie.mkv has been deleted from Google Drive.
 
 5. **Google API Key** *(optional but recommended)* — Enables the direct `googleapis.com` download link accessible from Iran.
 
-6. **Python 3.12+** and **aria2** — Easily installed on Ubuntu 24.04.
+6. **Python 3.12+**, **aria2** and **ffmpeg** — Easily installed on Ubuntu 24.04.
 
 ---
 
@@ -95,8 +97,8 @@ cd telegram-drive-bot
 # Install Python packages
 pip3 install --break-system-packages -r requirements.txt
 
-# Install aria2
-apt install -y aria2
+# Install aria2 and ffmpeg (ffmpeg merges video+audio streams)
+apt install -y aria2 ffmpeg
 ```
 
 ### Step 2 — Create a Google Cloud OAuth App
